@@ -1,7 +1,7 @@
 //! Abstractions over different socket types of crates in the Rust ecosystem.
 
 use std::io;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -10,12 +10,11 @@ use async_tls::{
     client::TlsStream as TlsStreamCli,
     server::TlsStream as TlsStreamSrv,
 };
+use async_tls::server::TlsStream;
 
 use futures::io::{
     AsyncRead,
     AsyncWrite,
-    BufReader,
-    BufWriter,
 };
 
 use rustls::{ClientConnection, ServerConnection, StreamOwned};
@@ -179,34 +178,64 @@ impl AsyncWrite for AsyncSocket {
 }
 
 pub enum SecureSocketRecvAsync {
-    Plain(BufReader<AsyncSocket>),
-    Tls(TlsStreamSrv<AsyncSocket>),
+    Plain(futures::io::BufReader<AsyncSocket>),
+    Tls(futures::io::BufReader<TlsStreamSrv<AsyncSocket>>),
 }
 
 pub enum SecureSocketSendAsync {
-    Plain(BufWriter<AsyncSocket>),
-    Tls(TlsStreamCli<AsyncSocket>),
+    Plain(futures::io::BufWriter<AsyncSocket>),
+    Tls(futures::io::BufWriter<TlsStreamCli<AsyncSocket>>),
 }
 
 pub enum SecureSocketRecvSync {
-    Plain(SyncSocket),
-    Tls(StreamOwned<ServerConnection, SyncSocket>),
+    Plain(std::io::BufReader<SyncSocket>),
+    Tls(std::io::BufReader<StreamOwned<ServerConnection, SyncSocket>>),
 }
 
 pub enum SecureSocketSendSync {
-    Plain(SyncSocket),
-    Tls(StreamOwned<ClientConnection, SyncSocket>),
+    Plain(std::io::BufWriter<SyncSocket>),
+    Tls(std::io::BufWriter<StreamOwned<ClientConnection, SyncSocket>>),
+}
+
+impl SecureSocketRecvAsync {
+    pub fn new_plain(socket: AsyncSocket) -> Self {
+        SecureSocketRecvAsync::Plain(futures::io::BufReader::new(socket))
+    }
+
+    pub fn new_tls(session: TlsStream<AsyncSocket>) -> Self {
+        SecureSocketRecvAsync::Tls(futures::io::BufReader::new(session))
+    }
+}
+
+impl SecureSocketSendAsync {
+    pub fn new_plain(socket: AsyncSocket) -> Self {
+        SecureSocketSendAsync::Plain(futures::io::BufWriter::new(socket))
+    }
+
+    pub fn new_tls(session: TlsStreamCli<AsyncSocket>) -> Self {
+        SecureSocketSendAsync::Tls(futures::io::BufWriter::new(session))
+    }
 }
 
 impl SecureSocketRecvSync {
+    pub fn new_plain(socket: SyncSocket) -> Self {
+        SecureSocketRecvSync::Plain(std::io::BufReader::new(socket))
+    }
+    
     pub fn new_tls(session: ServerConnection, socket: SyncSocket) -> Self {
-        SecureSocketRecvSync::Tls(StreamOwned::new(session, socket))
+        SecureSocketRecvSync::Tls(std::io::BufReader::new(StreamOwned::new(session, socket)))
+
     }
 }
 
 impl SecureSocketSendSync {
+    pub fn new_plain(socket: SyncSocket) -> Self {
+        SecureSocketSendSync::Plain(std::io::BufWriter::new(socket))
+    }
+    
     pub fn new_tls(session: ClientConnection, socket: SyncSocket) -> Self {
-        SecureSocketSendSync::Tls(StreamOwned::new(session, socket))
+        SecureSocketSendSync::Tls(std::io::BufWriter::new(StreamOwned::new(session, socket)))
+
     }
 }
 
@@ -403,8 +432,8 @@ fn set_listener_options(listener: AsyncListener) -> io::Result<AsyncListener> {
 #[inline]
 fn set_listener_options_replica(listener: SyncListener) -> io::Result<SyncListener> {
     let sock = socket2::SockRef::from(&listener.inner);
-    sock.set_send_buffer_size(8 * 10240 * 1024)?;
-    sock.set_recv_buffer_size(8 * 10240 * 1024)?;
+    sock.set_send_buffer_size(8 * 1024 * 1024)?;
+    sock.set_recv_buffer_size(8 * 1024 * 1024)?;
     sock.set_reuse_address(true)?;
     sock.set_keepalive(true)?;
     sock.set_nodelay(true)?;
@@ -418,8 +447,8 @@ fn set_listener_options_replica(listener: SyncListener) -> io::Result<SyncListen
 #[inline]
 fn set_sockstream_options(connection: AsyncSocket) -> io::Result<AsyncSocket> {
     let sock = socket2::SockRef::from(&connection.inner);
-    sock.set_send_buffer_size(8 * 10240 * 1024)?;
-    sock.set_recv_buffer_size(8 * 10240 * 1024)?;
+    sock.set_send_buffer_size(8 * 1024 * 1024)?;
+    sock.set_recv_buffer_size(8 * 1024 * 1024)?;
     sock.set_keepalive(true)?;
     sock.set_nodelay(true)?;
     // ChannelOption.CONNECT_TIMEOUT_MILLIS ??
@@ -430,8 +459,8 @@ fn set_sockstream_options(connection: AsyncSocket) -> io::Result<AsyncSocket> {
 #[inline]
 fn set_sockstream_options_sync(connection: SyncSocket) -> io::Result<SyncSocket> {
     let sock = socket2::SockRef::from(&connection.inner);
-    sock.set_send_buffer_size(8 * 10240 * 1024)?;
-    sock.set_recv_buffer_size(8 * 10240 * 1024)?;
+    sock.set_send_buffer_size(8 * 1024 * 1024)?;
+    sock.set_recv_buffer_size(8 * 1024 * 1024)?;
     sock.set_keepalive(true)?;
     sock.set_nodelay(true)?;
     // ChannelOption.CONNECT_TIMEOUT_MILLIS ??
