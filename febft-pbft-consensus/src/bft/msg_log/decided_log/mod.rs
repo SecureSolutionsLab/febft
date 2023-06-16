@@ -8,85 +8,37 @@ use atlas_common::globals::ReadOnly;
 use atlas_common::node_id::NodeId;
 use atlas_common::ordering::{Orderable, SeqNo};
 use atlas_communication::message::StoredMessage;
+use atlas_communication::Node;
+use atlas_core::ordering_protocol::{DecisionInformation, ExecutionResult, ProtocolConsensusDecision};
+use atlas_core::persistent_log::{OrderingProtocolLog, StatefulOrderingProtocolLog, WriteMode};
+use atlas_core::serialize::StateTransferMessage;
 use atlas_execution::app::{Request, Service, State, UpdateBatch};
 use atlas_execution::serialize::SharedData;
 use atlas_core::state_transfer::Checkpoint;
 
-use crate::bft::message::{ConsensusMessage, ConsensusMessageKind};
-use crate::bft::msg_log::{Info, operation_key, CHECKPOINT_PERIOD};
+use crate::bft::message::{ConsensusMessage, ConsensusMessageKind, PBFTMessage};
+use crate::bft::message::serialize::PBFTConsensus;
+use crate::bft::msg_log::{operation_key};
 use crate::bft::msg_log::decisions::{CollectData, DecisionLog, Proof, ProofMetadata};
 use crate::bft::msg_log::deciding_log::{CompletedBatch, DecidingLog};
-use crate::bft::msg_log::persistent::{InstallState, PersistentLog, WriteMode};
+use crate::bft::{PBFT, PBFTOrderProtocol};
 use crate::bft::sync::view::ViewInfo;
-
-pub(crate) enum CheckpointState<D> {
-    // no checkpoint has been performed yet
-    None,
-    // we are calling this a partial checkpoint because we are
-    // waiting for the application state from the execution layer
-    Partial {
-        // sequence number of the last executed request
-        seq: SeqNo,
-    },
-    PartialWithEarlier {
-        // sequence number of the last executed request
-        seq: SeqNo,
-        // save the earlier checkpoint, in case corruption takes place
-        earlier: Arc<ReadOnly<Checkpoint<D>>>,
-    },
-    // application state received, the checkpoint state is finalized
-    Complete(Arc<ReadOnly<Checkpoint<D>>>),
-}
 
 /// The log of decisions that have already been processed by the consensus
 /// algorithm
-pub struct Log<D> where D: SharedData + 'static {
-    //This item will only be accessed by the replica request thread
-    //The current stored SeqNo in the checkpoint state.
-    //NOTE: THIS IS NOT THE CURR_SEQ NUMBER IN THE CONSENSUS
-    curr_seq: SeqNo,
-
+pub struct Log<D, PL> where D: SharedData + 'static {
     // The log for all of the already decided consensus instances
     dec_log: DecisionLog<D::Request>,
 
-    //The most recent checkpoint that we have.
-    //Contains the app state and the last executed seq no on
-    //That app state
-    checkpoint: CheckpointState<D::State>,
-
     // A handle to the persistent log
-    persistent_log: PersistentLog<D>,
+    persistent_log: PL,
 }
 
-/// Execution data for the given batch
-/// Info: Whether we need to ask the executor for a checkpoint in order to reset the current message log
-/// Update Batch: All of the requests that should be executed, in the correct order
-/// Completed Batch: The information collected by the [DecidingLog], if applicable. (We can receive a batch
-/// via a complete proof which means this will be [None] or we can process a batch normally, which means
-/// this will be [Some(CompletedBatch<D>)])
-pub struct BatchExecutionInfo<O> {
-    info: Info,
-    update_batch: UpdateBatch<O>,
-    completed_batch: Option<CompletedBatch<O>>,
-}
-
-impl<D> Log<D> where D: SharedData + 'static {
-    pub(crate) fn init_decided_log(node_id: NodeId, persistent_log: PersistentLog<D>, state: Option<Arc<ReadOnly<Checkpoint<D::State>>>>) -> Self {
-
-        //TODO: Maybe read state from local storage?
-        let checkpoint = if let Some(state) = state {
-            CheckpointState::Complete(state)
-        } else {
-            CheckpointState::None
-        };
-
-        let dec_log = DecisionLog::new();
-
+impl<D, PL> Log<D, PL> where D: SharedData + 'static {
+    pub(crate) fn init_decided_log(node_id: NodeId, persistent_log: PL,
+                                   dec_log: Option<DecisionLog<D::Request>>) -> Self {
         Self {
-            curr_seq: SeqNo::ZERO,
-            dec_log,
-            checkpoint,
-
+            dec_log: dec_log.unwrap_or(DecisionLog::new()),
             persistent_log,
         }
     }
@@ -104,15 +56,12 @@ impl<D> Log<D> where D: SharedData + 'static {
     /// Read the current state, if existent, from the persistent storage
     ///
     /// FIXME: The view initialization might have to be changed if we want to introduce reconfiguration
-    pub fn read_current_state(&self, n: usize, f: usize) -> Result<Option<(Arc<ReadOnly<Checkpoint<D::State>>>, ViewInfo, DecisionLog<D::Request>)>> {
-        let option = self.persistent_log.read_state()?;
+    pub fn read_current_state(&self, n: usize, f: usize) -> Result<Option<(ViewInfo, DecisionLog<D::Request>)>>
+        where PL: StatefulOrderingProtocolLog<PBFTConsensus<D>, PBFTConsensus<D>> {
+        let option = self.persistent_log.read_state(WriteMode::BlockingSync)?;
 
-        if let Some(state) = option {
-            let (view_seq, checkpoint, dec_log) = state;
-
-            let view_seq = ViewInfo::new(view_seq, n, f)?;
-
-            Ok(Some((checkpoint.clone(), view_seq, dec_log)))
+        if let Some((view, dec_log)) = option {
+            Ok(Some((view, dec_log)))
         } else {
             Ok(None)
         }
@@ -123,12 +72,8 @@ impl<D> Log<D> where D: SharedData + 'static {
     /// This method may fail if we are waiting for the latest application
     /// state to be returned by the execution layer.
     ///
-    pub fn snapshot(&self, view: ViewInfo) -> Result<(Arc<ReadOnly<Checkpoint<D::State>>>, ViewInfo, DecisionLog<D::Request>)> {
-        match &self.checkpoint {
-            CheckpointState::Complete(checkpoint) =>
-                Ok((checkpoint.clone(), view, self.dec_log.clone())),
-            _ => Err("Checkpoint to be finalized").wrapped(ErrorKind::MsgLogPersistent),
-        }
+    pub fn snapshot(&self, view: ViewInfo) -> Result<(ViewInfo, DecisionLog<D::Request>)> {
+        Ok((view, self.dec_log.clone()))
     }
 
     /// Insert a consensus message into the log.
@@ -137,8 +82,9 @@ impl<D> Log<D> where D: SharedData + 'static {
     /// This is mostly used for pre prepares as they contain all the requests and are therefore very expensive to send
     pub fn insert_consensus(
         &mut self,
-        consensus_msg: Arc<ReadOnly<StoredMessage<ConsensusMessage<D::Request>>>>,
-    ) {
+        consensus_msg: Arc<ReadOnly<StoredMessage<PBFTMessage<D::Request>>>>,
+    ) where PL: OrderingProtocolLog<PBFTConsensus<D>>,
+    {
         if let Err(err) = self
             .persistent_log
             .write_message(WriteMode::NonBlockingSync(None), consensus_msg)
@@ -151,8 +97,9 @@ impl<D> Log<D> where D: SharedData + 'static {
     /// This is done when we receive the final SYNC message from the leader
     /// which contains all of the collects
     /// If we are missing the request determined by the
-    pub fn install_proof(&mut self, seq: SeqNo, proof: Proof<D::Request>) -> Result<Option<BatchExecutionInfo<D::Request>>> {
-        let batch_execution_info = BatchExecutionInfo::from(&proof);
+    pub fn install_proof(&mut self, seq: SeqNo, proof: Proof<D::Request>) -> Result<ProtocolConsensusDecision<D::Request>>
+        where PL: OrderingProtocolLog<PBFTConsensus<D>> {
+        let batch_execution_info = ProtocolConsensusDecision::from(&proof);
 
         if let Some(decision) = self.decision_log().last_decision() {
             if decision.seq_no() == seq {
@@ -171,57 +118,31 @@ impl<D> Log<D> where D: SharedData + 'static {
             error!("Failed to persist proof {:?}", err);
         }
 
-        // Communicate with the persistent log about persisting this batch and then executing it
-        self.persistent_log.wait_for_proof_persistency_and_execute(batch_execution_info)
+        Ok(batch_execution_info)
     }
 
     /// Clear the occurrences of a seq no from the decision log
-    pub fn clear_last_occurrence(&mut self, seq: SeqNo) {
+    pub fn clear_last_occurrence(&mut self, seq: SeqNo)
+        where
+            PL: OrderingProtocolLog<PBFTConsensus<D>> {
         if let Err(err) = self.persistent_log.write_invalidate(WriteMode::NonBlockingSync(None), seq) {
             error!("Failed to invalidate last occurrence {:?}", err);
         }
     }
 
     /// Update the log state, received from the CST protocol.
-    pub fn install_state(&mut self, checkpoint: Arc<ReadOnly<Checkpoint<D::State>>>, dec_log: DecisionLog<D::Request>) {
+    pub fn install_state(&mut self, view: ViewInfo, dec_log: DecisionLog<D::Request>)
+        where PL: StatefulOrderingProtocolLog<PBFTConsensus<D>, PBFTConsensus<D>> {
 
         //Replace the log
         self.dec_log = dec_log.clone();
 
         let last_seq = self.dec_log.last_execution().unwrap_or(SeqNo::ZERO);
 
-        // self.decided = rs.requests;
-        self.checkpoint = CheckpointState::Complete(checkpoint.clone());
-        self.curr_seq = last_seq.clone();
-
         if let Err(err) = self.persistent_log
-            .write_install_state(WriteMode::NonBlockingSync(None),
-                                 (last_seq, checkpoint, dec_log)) {
+            .write_install_state(WriteMode::NonBlockingSync(None), view, dec_log) {
             error!("Failed to persist message {:?}", err);
         }
-    }
-
-    fn begin_checkpoint(&mut self, seq: SeqNo) -> Result<Info> {
-        let earlier = std::mem::replace(&mut self.checkpoint, CheckpointState::None);
-
-        self.checkpoint = match earlier {
-            CheckpointState::None => CheckpointState::Partial { seq },
-            CheckpointState::Complete(earlier) => {
-                CheckpointState::PartialWithEarlier { seq, earlier }
-            }
-            // FIXME: this may not be an invalid state after all; we may just be generating
-            // checkpoints too fast for the execution layer to keep up, delivering the
-            // hash digests of the appstate
-            _ => {
-                error!("Invalid checkpoint state detected");
-
-                self.checkpoint = earlier;
-                
-                return Ok(Info::Nil);
-            }
-        };
-
-        Ok(Info::BeginCheckpoint)
     }
 
     /// End the state of an on-going checkpoint.
@@ -229,51 +150,25 @@ impl<D> Log<D> where D: SharedData + 'static {
     /// This method should only be called when `finalize_request()` reports
     /// `Info::BeginCheckpoint`, and the requested application state is received
     /// on the core server task's master channel.
-    pub fn finalize_checkpoint(&mut self, checkpoint: Arc<ReadOnly<Checkpoint<D::State>>>) -> Result<()> {
-        match &self.checkpoint {
-            CheckpointState::None => {
-                Err("No checkpoint has been initiated yet").wrapped(ErrorKind::MsgLog)
-            }
-            CheckpointState::Complete(_) => {
-                Err("Checkpoint already finalized").wrapped(ErrorKind::MsgLog)
-            }
-            CheckpointState::Partial { seq: _ } | CheckpointState::PartialWithEarlier { seq: _, .. } => {
-                let final_seq = checkpoint.sequence_number();
+    pub fn finalize_checkpoint(&mut self, final_seq: SeqNo) -> Result<()> {
+        let mut decided_request_count;
 
-                let checkpoint_state = CheckpointState::Complete(checkpoint.clone());
+        //Clear the log of messages up to final_seq.
+        //Messages ahead of final_seq will not be removed as they are not included in the
+        //Checkpoint and therefore must be logged.
+        {
+            let mut guard = &mut self.dec_log;
 
-                self.checkpoint = checkpoint_state;
-
-                let mut decided_request_count;
-
-                //Clear the log of messages up to final_seq.
-                //Messages ahead of final_seq will not be removed as they are not included in the
-                //Checkpoint and therefore must be logged.
-                {
-                    let mut guard = &mut self.dec_log;
-
-                    decided_request_count = guard.clear_until_seq(final_seq);
-
-                    if let Some(last_sq) = guard.last_decision() {
-                        // store the id of the last received pre-prepare,
-                        // which corresponds to the request currently being
-                        // processed
-                        self.curr_seq = last_sq.sequence_number();
-                    } else {
-                        self.curr_seq = final_seq;
-                    }
-                }
-
-                self.persistent_log.write_checkpoint(WriteMode::NonBlockingSync(None), checkpoint)?;
-
-                Ok(())
-            }
+            decided_request_count = guard.clear_until_seq(final_seq);
         }
+
+        Ok(())
     }
 
     /// Register that all the batches for a given decision have already been received
     /// Basically persists the metadata for a given consensus num
-    pub fn all_batches_received(&mut self, metadata: ProofMetadata) {
+    pub fn all_batches_received(&mut self, metadata: ProofMetadata) where
+        PL: OrderingProtocolLog<PBFTConsensus<D>> {
         self.persistent_log.write_proof_metadata(WriteMode::NonBlockingSync(None),
                                                  metadata).unwrap();
     }
@@ -292,7 +187,7 @@ impl<D> Log<D> where D: SharedData + 'static {
         &mut self,
         seq: SeqNo,
         completed_batch: CompletedBatch<D::Request>,
-    ) -> Result<Option<BatchExecutionInfo<D::Request>>> {
+    ) -> Result<ProtocolConsensusDecision<D::Request>> {
         //println!("Finalized batch of OPS seq {:?} on Node {:?}", seq, self.node_id);
 
         let batch = {
@@ -300,7 +195,7 @@ impl<D> Log<D> where D: SharedData + 'static {
 
             for message in completed_batch.pre_prepare_messages() {
                 let reqs = {
-                    if let ConsensusMessageKind::PrePrepare(reqs) = (*message.message().kind()).clone() {
+                    if let ConsensusMessageKind::PrePrepare(reqs) = (*message.message().consensus().kind()).clone() {
                         reqs
                     } else { unreachable!() }
                 };
@@ -332,31 +227,17 @@ impl<D> Log<D> where D: SharedData + 'static {
             batch
         };
 
-        let last_seq_no_u32 = u32::from(seq);
-
-        let info = if last_seq_no_u32 > 0 && last_seq_no_u32 % CHECKPOINT_PERIOD == 0 {
-            //We check that % == 0 so we don't start multiple checkpoints
-            self.begin_checkpoint(seq)?
-        } else {
-            Info::Nil
-        };
-
         // the last executed sequence number
         let f = 1;
 
-        //
         // Finalize the execution and store the proof in the log as a proof
         // instead of an ongoing decision
         self.dec_log.finished_quorum_execution(&completed_batch, seq, f)?;
 
-        // Queue the batch for the execution
-        let result = self.persistent_log.wait_for_batch_persistency_and_execute(BatchExecutionInfo {
-            info,
-            update_batch: batch,
-            completed_batch: Some(completed_batch),
-        });
+        let decision = ProtocolConsensusDecision::new(seq, batch,
+                                                      Some(DecisionInformation::from(completed_batch)));
 
-        result
+        Ok(decision)
     }
 
     /// Collects the most up to date data we have in store.
@@ -368,25 +249,7 @@ impl<D> Log<D> where D: SharedData + 'static {
     }
 }
 
-impl<O> BatchExecutionInfo<O> {
-    pub fn info(&self) -> &Info {
-        &self.info
-    }
-    pub fn update_batch(&self) -> &UpdateBatch<O> {
-        &self.update_batch
-    }
-    pub fn completed_batch(&self) -> &Option<CompletedBatch<O>> {
-        &self.completed_batch
-    }
-}
-
-impl<O> Into<(Info, UpdateBatch<O>, Option<CompletedBatch<O>>)> for BatchExecutionInfo<O> {
-    fn into(self) -> (Info, UpdateBatch<O>, Option<CompletedBatch<O>>) {
-        (self.info, self.update_batch, self.completed_batch)
-    }
-}
-
-impl<O> From<&Proof<O>> for BatchExecutionInfo<O> where O: Clone {
+impl<O> From<&Proof<O>> for ProtocolConsensusDecision<O> where O: Clone {
     fn from(value: &Proof<O>) -> Self {
         let mut update_batch = UpdateBatch::new(value.seq_no());
 
@@ -398,7 +261,7 @@ impl<O> From<&Proof<O>> for BatchExecutionInfo<O> where O: Clone {
         for pre_prepare in value.pre_prepares() {
             let consensus_msg = (*pre_prepare.message()).clone();
 
-            let reqs = match consensus_msg.into_kind() {
+            let reqs = match consensus_msg.into_consensus().into_kind() {
                 ConsensusMessageKind::PrePrepare(reqs) => { reqs }
                 _ => {
                     unreachable!()
@@ -415,10 +278,8 @@ impl<O> From<&Proof<O>> for BatchExecutionInfo<O> where O: Clone {
             }
         }
 
-        Self {
-            info: Info::Nil,
-            update_batch,
-            completed_batch: None,
-        }
+        ProtocolConsensusDecision::new(value.seq_no(),
+                                       update_batch,
+                                       None)
     }
 }

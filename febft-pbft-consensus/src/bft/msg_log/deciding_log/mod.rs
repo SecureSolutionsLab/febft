@@ -10,6 +10,8 @@ use atlas_common::error::*;
 use atlas_common::node_id::NodeId;
 use atlas_common::ordering::{Orderable, SeqNo};
 use atlas_communication::message::StoredMessage;
+use atlas_core::messages::ClientRqInfo;
+use atlas_core::ordering_protocol::DecisionInformation;
 use atlas_metrics::benchmarks::BatchMeta;
 use atlas_metrics::metrics::metric_duration;
 use crate::bft::message::{ConsensusMessage, ConsensusMessageKind};
@@ -34,10 +36,8 @@ pub struct CompletedBatch<O> {
     prepare_messages: Vec<StoredConsensusMessage<O>>,
     // The commit messages for this batch
     commit_messages: Vec<StoredConsensusMessage<O>>,
-
-    //The amount of requests contained in this batch
-    request_count: usize,
-
+    // The information of the client requests that are contained in this batch
+    client_requests: Vec<ClientRqInfo>,
     //The messages that must be persisted for this consensus decision to be executable
     //This should contain the pre prepare, quorum of prepares and quorum of commits
     messages_to_persist: Vec<Digest>,
@@ -60,6 +60,10 @@ pub struct DecidingLog<O> {
     current_received_pre_prepares: usize,
     //The size of batch that is currently being processed. Increases as we receive more pre prepares
     current_batch_size: usize,
+    //The client requests that are currently being processed
+    //Does not have to follow the correct order, only has to contain the requests
+    client_rqs: Vec<ClientRqInfo>,
+
     // The message log of the current ongoing decision
     ongoing_decision: OnGoingDecision<O>,
 
@@ -118,6 +122,7 @@ impl<O> DecidingLog<O> {
             current_batch_size: 0,
             current_messages_to_persist: vec![],
             batch_meta: Arc::new(Mutex::new(BatchMeta::new())),
+            client_rqs: vec![],
         }
     }
 
@@ -144,7 +149,7 @@ impl<O> DecidingLog<O> {
     pub fn process_pre_prepare(&mut self,
                                request_batch: StoredConsensusMessage<O>,
                                digest: Digest,
-                               mut batch_rq_digests: Vec<Digest>) -> Result<Option<FullBatch>> {
+                               mut batch_rq_digests: Vec<ClientRqInfo>) -> Result<Option<FullBatch>> {
         let start = Instant::now();
 
         let sending_leader = request_batch.header().from();
@@ -158,7 +163,7 @@ impl<O> DecidingLog<O> {
 
         if request_batch.header().from() != self.node_id {
             for request in &batch_rq_digests {
-                if !crate::bft::sync::view::is_request_in_hash_space(request, slice) {
+                if !crate::bft::sync::view::is_request_in_hash_space(&request.digest(), slice) {
                     return Err(Error::simple_with_msg(ErrorKind::MsgLogDecidingLog,
                                                       "This batch contains requests that are not in the hash space of the leader."));
                 }
@@ -174,7 +179,10 @@ impl<O> DecidingLog<O> {
 
         self.current_received_pre_prepares += 1;
 
+        //
         self.current_batch_size += batch_rq_digests.len();
+
+        self.client_rqs.append(&mut batch_rq_digests);
 
         // Register this new batch as one that must be persisted for this batch to be executed
         self.register_message_to_save(digest);
@@ -218,7 +226,7 @@ impl<O> DecidingLog<O> {
 
     /// Process the message received
     pub(crate) fn process_message(&mut self, message: StoredConsensusMessage<O>) -> Result<()> {
-        match message.message().kind() {
+        match message.message().consensus().kind() {
             ConsensusMessageKind::Prepare(_) => {
                 self.duplicate_detection.insert_prepare_received(message.header().from())?;
             }
@@ -267,7 +275,7 @@ impl<O> DecidingLog<O> {
             pre_prepare_messages,
             prepare_messages,
             commit_messages,
-            request_count: self.current_batch_size,
+            client_requests: self.client_rqs,
             messages_to_persist,
             batch_meta,
         })
@@ -309,7 +317,7 @@ impl<O> OnGoingDecision<O> {
 
     /// Insert a consensus message into this on going decision
     fn insert_message(&mut self, message: StoredConsensusMessage<O>) {
-        match message.message().kind() {
+        match message.message().consensus().kind() {
             ConsensusMessageKind::Prepare(_) => {
                 self.prepare_messages.push(message);
             }
@@ -324,7 +332,7 @@ impl<O> OnGoingDecision<O> {
 
     /// Insert a message from the stored message into this on going decision
     pub fn insert_persisted_msg(&mut self, message: StoredConsensusMessage<O>) -> Result<()> {
-        match message.message().kind() {
+        match message.message().consensus().kind() {
             ConsensusMessageKind::PrePrepare(_) => {
                 let index = pre_prepare_index_from_digest_opt(&self.pre_prepare_digests, message.header().digest())?;
 
@@ -346,15 +354,15 @@ impl<O> OnGoingDecision<O> {
             let mut buf = Vec::new();
 
             for stored in self.prepare_messages.iter().rev() {
-                match stored.message().sequence_number().cmp(&in_exec) {
+                match stored.message().consensus().sequence_number().cmp(&in_exec) {
                     Ordering::Equal => {
-                        let digest = match stored.message().kind() {
+                        let digest = match stored.message().consensus().kind() {
                             ConsensusMessageKind::Prepare(d) => d.clone(),
                             _ => unreachable!(),
                         };
 
                         buf.push(ViewDecisionPair(
-                            stored.message().view(),
+                            stored.message().consensus().view(),
                             digest,
                         ));
                     }
@@ -375,21 +383,21 @@ impl<O> OnGoingDecision<O> {
             let mut count = 0;
 
             for stored in self.prepare_messages.iter().rev() {
-                match stored.message().sequence_number().cmp(&in_exec) {
+                match stored.message().consensus().sequence_number().cmp(&in_exec) {
                     Ordering::Equal => {
                         match last_view {
                             None => (),
-                            Some(v) if stored.message().view() == v => (),
+                            Some(v) if stored.message().consensus().view() == v => (),
                             _ => count = 0,
                         }
-                        last_view = Some(stored.message().view());
+                        last_view = Some(stored.message().consensus().view());
                         count += 1;
                         if count == quorum {
-                            let digest = match stored.message().kind() {
+                            let digest = match stored.message().consensus().kind() {
                                 ConsensusMessageKind::Prepare(d) => d.clone(),
                                 _ => unreachable!(),
                             };
-                            break 'outer Some(ViewDecisionPair(stored.message().view(), digest));
+                            break 'outer Some(ViewDecisionPair(stored.message().consensus().view(), digest));
                         }
                     }
                     Ordering::Less => break,
@@ -461,9 +469,9 @@ impl<O> CompletedBatch<O> {
     pub fn batch_meta(&self) -> &BatchMeta {
         &self.batch_meta
     }
-    
+
     pub fn request_count(&self) -> usize {
-        self.request_count
+        self.client_requests.len()
     }
 
     /// Create a proof from the completed batch
@@ -569,4 +577,12 @@ pub fn make_proof_from<O>(proof_meta: ProofMetadata, mut ongoing: OnGoingDecisio
     }
 
     Ok(Proof::new(proof_meta, pre_prepare_messages, prepare_messages, commit_messages))
+}
+
+impl<O> From<CompletedBatch<O>> for DecisionInformation {
+    fn from(value: CompletedBatch<O>) -> Self {
+        DecisionInformation::new(value.batch_digest,
+                                 value.messages_to_persist,
+                                 value.client_requests)
+    }
 }

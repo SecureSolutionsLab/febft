@@ -21,6 +21,7 @@ use atlas_communication::{Node};
 use atlas_execution::app::{Request, Service};
 use atlas_execution::serialize::SharedData;
 use atlas_core::messages::{ClientRqInfo, ForwardedRequestsMessage, RequestMessage, StoredRequestMessage, SystemMessage};
+use atlas_core::persistent_log::{OrderingProtocolLog, StatefulOrderingProtocolLog};
 use atlas_core::request_pre_processing::{PreProcessorMessage, RequestPreProcessor};
 use atlas_core::serialize::StateTransferMessage;
 use atlas_core::timeouts::{RqTimeout, TimeoutKind, TimeoutPhase, Timeouts};
@@ -31,8 +32,7 @@ use crate::bft::message::serialize::PBFTConsensus;
 use crate::bft::message::{ConsensusMessage, ConsensusMessageKind, PBFTMessage, ViewChangeMessage, ViewChangeMessageKind};
 use crate::bft::metric::{SYNC_BATCH_RECEIVED_ID, SYNC_FORWARDED_COUNT_ID, SYNC_FORWARDED_REQUESTS_ID, SYNC_STOPPED_COUNT_ID, SYNC_STOPPED_REQUESTS_ID, SYNC_WATCH_REQUESTS_ID};
 use crate::bft::msg_log::decided_log::Log;
-use crate::bft::msg_log::decisions::CollectData;
-use crate::bft::msg_log::persistent::PersistentLogModeTrait;
+use crate::bft::msg_log::decisions::{CollectData, StoredConsensusMessage};
 use crate::bft::PBFT;
 use crate::bft::sync::view::ViewInfo;
 
@@ -63,17 +63,18 @@ impl<D: SharedData + 'static> ReplicaSynchronizer<D> {
     ///
     /// Therefore, we start by clearing our stopped requests and treating them as
     /// newly proposed requests (by resetting their timer)
-    pub(super) fn handle_stopping_quorum<ST, NT>(
+    pub(super) fn handle_stopping_quorum<ST, NT, PL>(
         &self,
         base_sync: &Synchronizer<D>,
         previous_view: ViewInfo,
-        consensus: &Consensus<D, ST>,
-        log: &Log<D>,
+        consensus: &Consensus<D, ST, PL>,
+        log: &Log<D, PL>,
         pre_processor: &RequestPreProcessor<D::Request>,
         timeouts: &Timeouts,
         node: &NT,
     )
-        where ST: StateTransferMessage + 'static, NT: Node<PBFT<D, ST>> {
+        where ST: StateTransferMessage + 'static, NT: Node<PBFT<D, ST>>,
+              PL: OrderingProtocolLog<PBFTConsensus<D>> {
         // NOTE:
         // - install new view (i.e. update view seq no) (Done in the synchronizer)
         // - add requests from STOP into client requests
@@ -165,12 +166,12 @@ impl<D: SharedData + 'static> ReplicaSynchronizer<D> {
     /// proposed, they won't timeout
     pub fn received_request_batch(
         &self,
-        pre_prepare: &StoredMessage<ConsensusMessage<D::Request>>,
+        pre_prepare: &StoredConsensusMessage<D::Request>,
         timeouts: &Timeouts,
-    ) -> Vec<Digest> {
+    ) -> Vec<ClientRqInfo> {
         let start_time = Instant::now();
 
-        let requests = match pre_prepare.message().kind() {
+        let requests = match pre_prepare.message().consensus().kind() {
             ConsensusMessageKind::PrePrepare(req) => { req }
             _ => {
                 error!("Cannot receive a request that is not a PrePrepare");
@@ -192,9 +193,10 @@ impl<D: SharedData + 'static> ReplicaSynchronizer<D> {
             let session = x.message().session_id();
 
             //let request_digest = header.digest().clone();
+            let client_rq_info = ClientRqInfo::new(digest, header.from(), seq_no, session);
 
-            digests.push(digest.clone());
-            timeout_info.push(ClientRqInfo::new(digest, header.from(), seq_no, session));
+            digests.push(client_rq_info.clone());
+            timeout_info.push(client_rq_info);
         }
 
         //Notify the timeouts that we have received the following requests
@@ -260,7 +262,7 @@ impl<D: SharedData + 'static> ReplicaSynchronizer<D> {
         base_sync: &Synchronizer<D>,
         my_id: NodeId,
         timed_out_rqs: &Vec<RqTimeout>,
-    ) -> SynchronizerStatus {
+    ) -> SynchronizerStatus<D::Request> {
 
         //// iterate over list of watched pending requests,
         //// and select the ones to be stopped or forwarded

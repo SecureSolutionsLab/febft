@@ -11,7 +11,6 @@ use atlas_core::serialize::{OrderingProtocolMessage, StateTransferMessage, Servi
 use atlas_core::state_transfer::Checkpoint;
 use atlas_core::timeouts::Timeouts;
 use crate::bft::message::serialize::PBFTConsensus;
-use crate::bft::msg_log::persistent::PersistentLogModeTrait;
 use crate::bft::observer::ObserverHandle;
 use crate::bft::sync::view::ViewInfo;
 
@@ -21,7 +20,6 @@ pub struct PBFTConfig<D: SharedData, ST> {
     pub follower_handle: Option<FollowerHandle<PBFTConsensus<D>>>,
     pub view: ViewInfo,
     pub timeout_dur: Duration,
-    pub db_path: String,
     pub proposer_config: ProposerConfig,
     pub watermark: u32,
     pub _phantom_data: PhantomData<ST>,
@@ -32,15 +30,13 @@ impl<D: SharedData + 'static,
     pub fn new(node_id: NodeId,
                follower_handle: Option<FollowerHandle<PBFTConsensus<D>>>,
                view: ViewInfo, timeout_dur: Duration,
-               watermark: u32,
-               db_path: String, proposer_config: ProposerConfig) -> Self {
+               watermark: u32, proposer_config: ProposerConfig) -> Self {
         Self {
             node_id,
             // observer_handle,
             follower_handle,
             view,
             timeout_dur,
-            db_path,
             proposer_config,
             watermark,
             _phantom_data: Default::default(),

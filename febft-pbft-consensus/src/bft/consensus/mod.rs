@@ -4,15 +4,12 @@ pub mod accessory;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, BTreeMap, BTreeSet, VecDeque};
 use std::iter;
-use std::os::linux::raw::stat;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
 use either::Either;
 use event_listener::Event;
 use log::{debug, error, info, trace, warn};
-use serde::de::Unexpected::Seq;
-use socket2::Protocol;
 use atlas_common::error::*;
 use atlas_common::crypto::hash::Digest;
 use atlas_common::globals::ReadOnly;
@@ -23,17 +20,19 @@ use atlas_communication::Node;
 use atlas_execution::ExecutorHandle;
 use atlas_execution::serialize::SharedData;
 use atlas_core::messages::{ClientRqInfo, RequestMessage, StoredRequestMessage, SystemMessage};
+use atlas_core::ordering_protocol::ProtocolConsensusDecision;
+use atlas_core::persistent_log::{OrderingProtocolLog, StatefulOrderingProtocolLog};
 use atlas_core::serialize::StateTransferMessage;
 use atlas_core::timeouts::Timeouts;
 use atlas_metrics::metrics::metric_increment;
 use crate::bft;
-use crate::bft::msg_log::Info;
 use crate::bft::consensus::decision::{ConsensusDecision, DecisionPhase, DecisionPollStatus, DecisionStatus, MessageQueue};
 use crate::bft::message::{ConsensusMessage, ConsensusMessageKind, PBFTMessage};
 use crate::bft::msg_log::decided_log::Log;
 use crate::bft::msg_log::deciding_log::{CompletedBatch, DecidingLog};
 use crate::bft::msg_log::decisions::{DecisionLog, IncompleteProof, Proof, StoredConsensusMessage};
 use crate::bft::{PBFT, SysMsg};
+use crate::bft::message::serialize::PBFTConsensus;
 use crate::bft::metric::OPERATIONS_PROCESSED_ID;
 use crate::bft::sync::{AbstractSynchronizer, Synchronizer};
 use crate::bft::sync::view::ViewInfo;
@@ -187,7 +186,7 @@ pub struct Signals {
 
 /// The consensus handler. Responsible for multiplexing consensus instances and keeping track
 /// of missing messages
-pub struct Consensus<D: SharedData + 'static, ST: StateTransferMessage + 'static> {
+pub struct Consensus<D: SharedData + 'static, ST: StateTransferMessage + 'static, PL: Clone> {
     node_id: NodeId,
     /// The handle to the executor of the function
     executor_handle: ExecutorHandle<D>,
@@ -202,7 +201,7 @@ pub struct Consensus<D: SharedData + 'static, ST: StateTransferMessage + 'static
     /// The consensus instances that are currently being processed
     /// A given consensus instance n will only be finished when all consensus instances
     /// j, where j < n have already been processed, in order to maintain total ordering
-    decisions: VecDeque<ConsensusDecision<D, ST>>,
+    decisions: VecDeque<ConsensusDecision<D, ST, PL>>,
     /// The queue for messages that sit outside the range seq_no + watermark
     /// These messages cannot currently be processed since they sit outside the allowed
     /// zone but they will be processed once the seq no moves forward enough to include them
@@ -213,15 +212,20 @@ pub struct Consensus<D: SharedData + 'static, ST: StateTransferMessage + 'static
     /// The consensus guard that will be used to ensure that the proposer only proposes one batch
     /// for each consensus instance
     consensus_guard: Arc<ProposerConsensusGuard>,
-    // A reference to the timeouts
+    /// A reference to the timeouts
     timeouts: Timeouts,
     /// Check if we are currently recovering from a fault, meaning we should ignore timeouts
     is_recovering: bool,
+
+    persistent_log: PL,
 }
 
-impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
-                                   ST: StateTransferMessage + 'static {
-    pub fn new_replica(node_id: NodeId, view: &ViewInfo, executor_handle: ExecutorHandle<D>, seq_no: SeqNo, watermark: u32, consensus_guard: Arc<ProposerConsensusGuard>, timeouts: Timeouts) -> Self {
+impl<D, ST, PL> Consensus<D, ST, PL> where D: SharedData + 'static,
+                                           ST: StateTransferMessage + 'static,
+                                           PL: Clone {
+    pub fn new_replica(node_id: NodeId, view: &ViewInfo, executor_handle: ExecutorHandle<D>, seq_no: SeqNo,
+                       watermark: u32, consensus_guard: Arc<ProposerConsensusGuard>, timeouts: Timeouts,
+                       persistent_log: PL) -> Self {
         let mut curr_seq = seq_no;
 
         let mut consensus = Self {
@@ -237,6 +241,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
             consensus_guard,
             timeouts,
             is_recovering: false,
+            persistent_log,
         };
 
         // Initialize the consensus instances
@@ -245,6 +250,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
                 node_id,
                 curr_seq,
                 view,
+                consensus.persistent_log.clone(),
             );
 
             consensus.enqueue_decision(decision);
@@ -359,9 +365,10 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
                                message: ConsensusMessage<D::Request>,
                                synchronizer: &Synchronizer<D>,
                                timeouts: &Timeouts,
-                               log: &mut Log<D>,
+                               log: &mut Log<D, PL>,
                                node: &NT) -> Result<ConsensusStatus>
-        where NT: Node<PBFT<D, ST>> {
+        where NT: Node<PBFT<D, ST>>,
+              PL: OrderingProtocolLog<PBFTConsensus<D>> {
         let message_seq = message.sequence_number();
 
         let view_seq = message.view();
@@ -431,6 +438,20 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
         self.decisions.front().map(|d| d.is_finalizeable()).unwrap_or(false)
     }
 
+    pub(super) fn finalizeable_count(&self) -> usize {
+        let mut count = 0;
+
+        for decision in &self.decisions {
+            if decision.is_finalizeable() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+
+        count
+    }
+
     /// Finalize the next consensus instance if possible
     pub fn finalize(&mut self, view: &ViewInfo) -> Result<Option<CompletedBatch<D::Request>>> {
 
@@ -459,7 +480,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
     /// Advance to the next instance of the consensus
     /// This will also create the necessary new decision to keep the pending decisions
     /// equal to the water mark
-    pub fn next_instance(&mut self, view: &ViewInfo) -> ConsensusDecision<D, ST> {
+    pub fn next_instance(&mut self, view: &ViewInfo) -> ConsensusDecision<D, ST, PL> {
         let decision = self.decisions.pop_front().unwrap();
 
         self.seq_no = self.seq_no.next();
@@ -484,7 +505,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
         let novel_decision = ConsensusDecision::init_with_msg_log(self.node_id,
                                                                   new_seq_no,
                                                                   view,
-                                                                  queue, );
+                                                                  self.persistent_log.clone(), queue, );
 
         self.enqueue_decision(novel_decision);
 
@@ -492,9 +513,9 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
     }
 
     /// Install the received state into the consensus
-    pub fn install_state(&mut self, state: D::State,
+    pub fn install_state(&mut self,
                          view_info: ViewInfo,
-                         dec_log: &DecisionLog<D::Request>) -> Result<(D::State, Vec<D::Request>)> {
+                         dec_log: &DecisionLog<D::Request>) -> Result<(Vec<D::Request>)> {
 
         // get the latest seq no
         let seq_no = {
@@ -526,7 +547,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
             }
 
             for pre_prepare in proof.pre_prepares() {
-                let x: &ConsensusMessage<D::Request> = pre_prepare.message();
+                let x: &ConsensusMessage<D::Request> = pre_prepare.message().consensus();
 
                 match x.kind() {
                     ConsensusMessageKind::PrePrepare(pre_prepare_reqs) => {
@@ -541,7 +562,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
             }
         }
 
-        Ok((state, reqs))
+        Ok(reqs)
     }
 
     pub fn install_sequence_number(&mut self, novel_seq_no: SeqNo, view: &ViewInfo) {
@@ -556,7 +577,8 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
                 let mut sequence_no = novel_seq_no;
 
                 while self.decisions.len() < self.watermark as usize {
-                    let novel_decision = ConsensusDecision::init_decision(self.node_id, sequence_no, view);
+                    let novel_decision = ConsensusDecision::init_decision(self.node_id,
+                                                                          sequence_no, view, self.persistent_log.clone());
 
                     self.enqueue_decision(novel_decision);
 
@@ -607,7 +629,8 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
                 while self.tbo_queue.sequence_number() < novel_seq_no && self.decisions.len() < self.watermark as usize {
                     let messages = self.tbo_queue.advance_queue();
 
-                    let decision = ConsensusDecision::init_with_msg_log(self.node_id, sequence_no, view, messages);
+                    let decision = ConsensusDecision::init_with_msg_log(self.node_id, sequence_no, view,
+                                                                        self.persistent_log.clone(), messages);
 
                     debug!("{:?} // Initialized new decision from TBO queue messages {:?}", self.node_id, decision.sequence_number());
 
@@ -617,7 +640,8 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
                 }
 
                 while self.decisions.len() < self.watermark as usize {
-                    let decision = ConsensusDecision::init_decision(self.node_id, sequence_no, view);
+                    let decision = ConsensusDecision::init_decision(self.node_id, sequence_no,
+                                                                    view, self.persistent_log.clone());
 
                     self.enqueue_decision(decision);
 
@@ -648,7 +672,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
                     let messages = self.tbo_queue.advance_queue();
 
                     let decision = ConsensusDecision::init_with_msg_log(self.node_id, sequence_no,
-                                                                        view, messages);
+                                                                        view, self.persistent_log.clone(), messages);
 
                     self.enqueue_decision(decision);
 
@@ -672,31 +696,17 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
                               seq: SeqNo,
                               view: &ViewInfo,
                               proof: Proof<D::Request>,
-                              log: &mut Log<D>) -> Result<()> {
+                              log: &mut Log<D, PL>) -> Result<ProtocolConsensusDecision<D::Request>>
+        where PL: OrderingProtocolLog<PBFTConsensus<D>> {
 
         // If this is successful, it means that we are all caught up and can now start executing the
         // batch
-        let should_execute = log.install_proof(seq, proof)?;
-
-        //TODO: Should we remove the requests that are in the proof from the pending request log?
-
-        if let Some(to_execute) = should_execute {
-            let (info, update, _) = to_execute.into();
-
-            match info {
-                Info::Nil => {
-                    self.executor_handle.queue_update(update)
-                }
-                Info::BeginCheckpoint => {
-                    self.executor_handle.queue_update_and_get_appstate(update)
-                }
-            }.unwrap();
-        }
+        let to_execute = log.install_proof(seq, proof)?;
 
         // Move to the next instance as this one has been finalized
         self.next_instance(view);
 
-        Ok(())
+        Ok(to_execute)
     }
 
     /// Create a fake `PRE-PREPARE`. This is useful during the view
@@ -743,7 +753,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
         let mut sequence_no = self.sequence_number();
 
         while self.decisions.len() < self.watermark as usize {
-            let novel_decision = ConsensusDecision::init_decision(self.node_id, sequence_no, view);
+            let novel_decision = ConsensusDecision::init_decision(self.node_id, sequence_no, view, self.persistent_log.clone());
 
             self.enqueue_decision(novel_decision);
 
@@ -790,9 +800,10 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
         (header, message): (Header, ConsensusMessage<D::Request>),
         synchronizer: &Synchronizer<D>,
         timeouts: &Timeouts,
-        log: &mut Log<D>,
+        log: &mut Log<D, PL>,
         node: &NT,
-    ) where NT: Node<PBFT<D, ST>> {
+    ) where NT: Node<PBFT<D, ST>>,
+            PL: OrderingProtocolLog<PBFTConsensus<D>> {
         let view = synchronizer.view();
         //Prepare the algorithm as we are already entering this phase
 
@@ -834,7 +845,7 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
     }
 
     /// Enqueue a decision onto our overlapping decision log
-    fn enqueue_decision(&mut self, decision: ConsensusDecision<D, ST>) {
+    fn enqueue_decision(&mut self, decision: ConsensusDecision<D, ST, PL>) {
         self.signalled.push_signalled(decision.sequence_number());
 
         self.decisions.push_back(decision);
@@ -856,7 +867,8 @@ impl<D, ST> Consensus<D, ST> where D: SharedData + 'static,
     }
 }
 
-impl<D, ST> Orderable for Consensus<D, ST> where D: SharedData + 'static, ST: StateTransferMessage + 'static {
+impl<D, ST, PL> Orderable for Consensus<D, ST, PL> where D: SharedData + 'static, ST: StateTransferMessage + 'static,
+                                                         PL: Clone  {
     fn sequence_number(&self) -> SeqNo {
         self.seq_no
     }

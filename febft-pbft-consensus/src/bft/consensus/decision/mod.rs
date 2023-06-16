@@ -11,17 +11,20 @@ use atlas_common::node_id::NodeId;
 use atlas_common::ordering::{Orderable, SeqNo};
 use atlas_communication::message::{Header, StoredMessage};
 use atlas_communication::Node;
+use atlas_core::messages::ClientRqInfo;
+use atlas_core::persistent_log::{OrderingProtocolLog, StatefulOrderingProtocolLog, WriteMode};
 use atlas_execution::serialize::SharedData;
 use atlas_core::serialize::StateTransferMessage;
 use atlas_core::timeouts::Timeouts;
 use atlas_metrics::metrics::{metric_duration};
 use crate::bft::consensus::accessory::{AccessoryConsensus, ConsensusDecisionAccessory};
 use crate::bft::consensus::accessory::replica::ReplicaAccessory;
-use crate::bft::message::{ConsensusMessage, ConsensusMessageKind};
+use crate::bft::message::{ConsensusMessage, ConsensusMessageKind, PBFTMessage};
+use crate::bft::message::serialize::PBFTConsensus;
 use crate::bft::metric::{ConsensusMetrics, PRE_PREPARE_ANALYSIS_ID};
 use crate::bft::msg_log::decided_log::Log;
 use crate::bft::msg_log::deciding_log::{CompletedBatch, DecidingLog};
-use crate::bft::msg_log::decisions::IncompleteProof;
+use crate::bft::msg_log::decisions::{IncompleteProof, StoredConsensusMessage};
 use crate::bft::PBFT;
 use crate::bft::sync::{AbstractSynchronizer, Synchronizer};
 use crate::bft::sync::view::ViewInfo;
@@ -99,7 +102,7 @@ pub struct MessageQueue<O> {
 }
 
 /// The information needed to make a decision on a batch of requests.
-pub struct ConsensusDecision<D: SharedData + 'static, ST: StateTransferMessage + 'static> {
+pub struct ConsensusDecision<D: SharedData + 'static, ST: StateTransferMessage + 'static, PL> {
     node_id: NodeId,
     /// The sequence number of this consensus decision
     seq: SeqNo,
@@ -109,6 +112,8 @@ pub struct ConsensusDecision<D: SharedData + 'static, ST: StateTransferMessage +
     message_queue: MessageQueue<D::Request>,
     /// The log of messages for this consensus instance
     message_log: DecidingLog<D::Request>,
+    /// Persistent log reference
+    persistent_log: PL,
     /// Accessory to the base consensus state machine
     accessory: ConsensusDecisionAccessory<D, ST>,
     // Metrics about the consensus instance
@@ -166,20 +171,22 @@ impl<O> MessageQueue<O> {
     }
 }
 
-impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecision<D, ST> {
-    pub fn init_decision(node_id: NodeId, seq_no: SeqNo, view: &ViewInfo) -> Self {
+impl<D: SharedData + 'static, ST: StateTransferMessage + 'static, PL> ConsensusDecision<D, ST, PL> {
+    pub fn init_decision(node_id: NodeId, seq_no: SeqNo, view: &ViewInfo, persistent_log: PL) -> Self {
         Self {
             node_id,
             seq: seq_no,
             phase: DecisionPhase::Initialize,
             message_queue: MessageQueue::new(),
             message_log: DecidingLog::new(node_id, seq_no, view),
+            persistent_log,
             accessory: ConsensusDecisionAccessory::Replica(ReplicaAccessory::new()),
             consensus_metrics: ConsensusMetrics::new(),
         }
     }
 
     pub fn init_with_msg_log(node_id: NodeId, seq_no: SeqNo, view: &ViewInfo,
+                             persistent_log: PL,
                              message_queue: MessageQueue<D::Request>) -> Self {
         Self {
             node_id,
@@ -187,6 +194,7 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecis
             phase: DecisionPhase::Initialize,
             message_queue,
             message_log: DecidingLog::new(node_id, seq_no, view),
+            persistent_log,
             accessory: ConsensusDecisionAccessory::Replica(ReplicaAccessory::new()),
             consensus_metrics: ConsensusMetrics::new(),
         }
@@ -249,13 +257,14 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecis
 
     /// Process a message relating to this consensus instance
     pub fn process_message<NT>(&mut self,
-                               header: Header,
-                               message: ConsensusMessage<D::Request>,
-                               synchronizer: &Synchronizer<D>,
-                               timeouts: &Timeouts,
-                               log: &mut Log<D>,
-                               node: &NT) -> Result<DecisionStatus>
-        where NT: Node<PBFT<D, ST>> {
+                                   header: Header,
+                                   message: ConsensusMessage<D::Request>,
+                                   synchronizer: &Synchronizer<D>,
+                                   timeouts: &Timeouts,
+                                   log: &mut Log<D, PL>,
+                                   node: &NT) -> Result<DecisionStatus>
+        where NT: Node<PBFT<D, ST>>,
+              PL: OrderingProtocolLog<PBFTConsensus<D>> {
         let view = synchronizer.view();
 
         return match self.phase {
@@ -322,6 +331,8 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecis
 
                 let pre_prepare_received_time = Utc::now();
 
+                let message = PBFTMessage::Consensus(message);
+
                 let stored_msg = Arc::new(ReadOnly::new(StoredMessage::new(header, message)));
 
                 let mut digests = request_batch_received(
@@ -334,6 +345,9 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecis
                 let batch_metadata = self.message_log.process_pre_prepare(stored_msg.clone(),
                                                                           stored_msg.header().digest().clone(),
                                                                           digests)?;
+
+                self.persistent_log.write_message(WriteMode::NonBlockingSync(None), stored_msg.clone())?;
+
                 let mut result = DecisionStatus::Deciding;
 
                 self.phase = if received == view.leader_set().len() {
@@ -431,9 +445,11 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecis
                     self.consensus_metrics.first_prepare_recvd();
                 }
 
-                let stored_msg = Arc::new(ReadOnly::new(StoredMessage::new(header, message)));
+                let stored_msg = Arc::new(ReadOnly::new(StoredMessage::new(header, PBFTMessage::Consensus(message))));
 
                 self.message_log.process_message(stored_msg.clone())?;
+
+                self.persistent_log.write_message(WriteMode::NonBlockingSync(None), stored_msg.clone())?;
 
                 let mut result = DecisionStatus::Deciding;
 
@@ -504,14 +520,15 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecis
                 }
 
                 let stored_msg = Arc::new(ReadOnly::new(
-                    StoredMessage::new(header, message)));
+                    StoredMessage::new(header, PBFTMessage::Consensus(message))));
 
                 self.message_log.process_message(stored_msg.clone())?;
+
+                self.persistent_log.write_message(WriteMode::NonBlockingSync(None), stored_msg.clone())?;
 
                 return if received == view.params().quorum() {
                     info!("{:?} // Completed commit phase with all commits Seq {:?} with commit from {:?}", node.id(), self.sequence_number(),
                     header.from());
-
 
                     self.phase = DecisionPhase::Decided;
 
@@ -574,7 +591,7 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> ConsensusDecis
     }
 }
 
-impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> Orderable for ConsensusDecision<D, ST> {
+impl<D: SharedData + 'static, ST: StateTransferMessage + 'static, PL> Orderable for ConsensusDecision<D, ST, PL> {
     fn sequence_number(&self) -> SeqNo {
         self.seq
     }
@@ -582,11 +599,11 @@ impl<D: SharedData + 'static, ST: StateTransferMessage + 'static> Orderable for 
 
 #[inline]
 fn request_batch_received<D>(
-    pre_prepare: &StoredMessage<ConsensusMessage<D::Request>>,
+    pre_prepare: &StoredConsensusMessage<D::Request>,
     timeouts: &Timeouts,
     synchronizer: &Synchronizer<D>,
     log: &DecidingLog<D::Request>,
-) -> Vec<Digest>
+) -> Vec<ClientRqInfo>
     where
         D: SharedData + 'static
 {
@@ -594,7 +611,7 @@ fn request_batch_received<D>(
 
     let mut batch_guard = log.batch_meta().lock().unwrap();
 
-    batch_guard.batch_size += match pre_prepare.message().kind() {
+    batch_guard.batch_size += match pre_prepare.message().consensus().kind() {
         ConsensusMessageKind::PrePrepare(req) => {
             req.len()
         }

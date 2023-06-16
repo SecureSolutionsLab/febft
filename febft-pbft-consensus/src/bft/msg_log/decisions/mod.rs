@@ -11,10 +11,11 @@ use atlas_common::globals::ReadOnly;
 use atlas_common::ordering::{Orderable, SeqNo};
 use atlas_communication::message::StoredMessage;
 use atlas_core::serialize::{OrderProtocolLog, OrderProtocolProof};
-use crate::bft::message::{ConsensusMessage, ConsensusMessageKind};
+use atlas_execution::serialize::SharedData;
+use crate::bft::message::{ConsensusMessage, ConsensusMessageKind, PBFTMessage};
 use crate::bft::msg_log::deciding_log::CompletedBatch;
 
-pub type StoredConsensusMessage<O> = Arc<ReadOnly<StoredMessage<ConsensusMessage<O>>>>;
+pub type StoredConsensusMessage<O> = Arc<ReadOnly<StoredMessage<PBFTMessage<O>>>>;
 
 #[cfg_attr(feature = "serialize_serde", derive(Serialize, Deserialize))]
 #[derive(Clone)]
@@ -48,6 +49,12 @@ pub struct ProofMetadata {
     pre_prepare_ordering: Vec<Digest>,
 }
 
+impl Orderable for ProofMetadata {
+    fn sequence_number(&self) -> SeqNo {
+        self.seq_no
+    }
+}
+
 /// Represents a single decision from the `DecisionLog`.
 #[cfg_attr(feature = "serialize_serde", derive(Serialize, Deserialize))]
 pub struct Proof<O> {
@@ -56,6 +63,7 @@ pub struct Proof<O> {
     prepares: Vec<StoredConsensusMessage<O>>,
     commits: Vec<StoredConsensusMessage<O>>,
 }
+
 
 /// Contains a collection of `ViewDecisionPair` values,
 /// pertaining to a particular consensus instance.
@@ -124,6 +132,10 @@ impl<O> Proof<O> {
             prepares,
             commits,
         }
+    }
+
+    pub(crate) fn metadata(&self) -> &ProofMetadata {
+        &self.metadata
     }
 
     /// Returns the `PRE-PREPARE` message of this `Proof`.
@@ -280,6 +292,18 @@ impl<O> DecisionLog<O> {
             decided: proofs,
         }
     }
+    
+    pub fn from_proofs(mut proofs: Vec<Proof<O>>) -> Self { 
+        
+        proofs.sort_by(|a, b| a.sequence_number().cmp(&b.sequence_number()).reverse());
+        
+        let last_decided = proofs.first().map(|proof| proof.sequence_number());
+        
+        Self {
+            last_exec: last_decided,
+            decided: proofs,
+        }
+    }
 
     /// Returns the sequence number of the last executed batch of client
     /// requests, assigned by the conesensus layer.
@@ -328,7 +352,7 @@ impl<O> DecisionLog<O> {
             if proof.seq_no <= seq_no {
                 for pre_prepare in &proof.pre_prepares {
                     //Mark the requests contained in this message for removal
-                    decided_request_count += match pre_prepare.message().kind() {
+                    decided_request_count += match pre_prepare.message().consensus().kind() {
                         ConsensusMessageKind::PrePrepare(messages) => messages.len(),
                         _ => 0,
                     };
