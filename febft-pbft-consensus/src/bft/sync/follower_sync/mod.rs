@@ -1,20 +1,16 @@
-use std::{marker::PhantomData, sync::Arc};
-use atlas_common::crypto::hash::Digest;
+use std::{marker::PhantomData};
 use atlas_common::ordering::Orderable;
-use atlas_communication::message::StoredMessage;
 use atlas_core::messages::ClientRqInfo;
-use atlas_execution::app::{Request, Service};
-use atlas_execution::serialize::SharedData;
+use atlas_smr_application::serialize::ApplicationData;
+use crate::bft::log::decisions::StoredConsensusMessage;
 
 use crate::bft::message::{ConsensusMessage, ConsensusMessageKind};
-use crate::bft::msg_log::decisions::StoredConsensusMessage;
 
-pub struct FollowerSynchronizer<D: SharedData> {
-    _phantom: PhantomData<D>
+pub struct FollowerSynchronizer<D: ApplicationData> {
+    _phantom: PhantomData<D>,
 }
 
-impl<D: SharedData + 'static> FollowerSynchronizer<D> {
-
+impl<D: ApplicationData + 'static> FollowerSynchronizer<D> {
     pub fn new() -> Self {
         Self { _phantom: Default::default() }
     }
@@ -24,12 +20,11 @@ impl<D: SharedData + 'static> FollowerSynchronizer<D> {
     /// proposed, they won't timeout
     pub fn watch_request_batch(
         &self,
-        pre_prepare: &StoredConsensusMessage<D::Request>,
+        pre_prepare: &ConsensusMessage<D::Request>,
     ) -> Vec<ClientRqInfo> {
-
-        let requests = match pre_prepare.message().consensus().kind() {
-            ConsensusMessageKind::PrePrepare(req) => {req},
-            _ => {panic!()}
+        let requests = match pre_prepare.kind() {
+            ConsensusMessageKind::PrePrepare(req) => { req }
+            _ => { panic!() }
         };
 
         let mut digests = Vec::with_capacity(requests.len());
@@ -62,5 +57,4 @@ impl<D: SharedData + 'static> FollowerSynchronizer<D> {
 
         digests
     }
-
 }
