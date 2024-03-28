@@ -1,18 +1,17 @@
-#![feature(inherent_associated_types)]
 
 use std::cmp::Ordering;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use anyhow::anyhow;
 
+use anyhow::anyhow;
 use log::{debug, error, info, warn};
 #[cfg(feature = "serialize_serde")]
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use atlas_common::channel::ChannelSyncTx;
 use atlas_common::{collections, Err};
+use atlas_common::channel::ChannelSyncTx;
 use atlas_common::collections::HashMap;
 use atlas_common::crypto::hash::Digest;
 use atlas_common::error::*;
@@ -20,27 +19,28 @@ use atlas_common::globals::ReadOnly;
 use atlas_common::node_id::NodeId;
 use atlas_common::ordering::{Orderable, SeqNo};
 use atlas_communication::message::{Header, StoredMessage};
-use atlas_communication::protocol_node::ProtocolNetworkNode;
-use atlas_core::messages::StateTransfer;
 use atlas_core::ordering_protocol::{ExecutionResult, OrderingProtocol};
 use atlas_core::ordering_protocol::networking::serialize::NetworkView;
-use atlas_core::persistent_log::{MonolithicStateLog, OperationMode, PersistableStateTransferProtocol};
-use atlas_core::state_transfer::{Checkpoint, CstM, StateTransferProtocol, STPollResult, STResult, STTimeoutResult};
-use atlas_core::state_transfer::monolithic_state::MonolithicStateTransfer;
-use atlas_core::state_transfer::networking::StateTransferSendNode;
+use atlas_core::persistent_log::{OperationMode, PersistableStateTransferProtocol};
 use atlas_core::timeouts::{RqTimeout, TimeoutKind, Timeouts};
-use atlas_smr_application::app::Application;
-use atlas_smr_application::serialize::ApplicationData;
-use atlas_smr_application::state::monolithic_state::{InstallStateMessage, MonolithicState};
 use atlas_metrics::metrics::metric_duration;
+use atlas_smr_application::state::monolithic_state::{InstallStateMessage, MonolithicState};
+use atlas_smr_core::persistent_log::MonolithicStateLog;
+use atlas_smr_core::state_transfer::{
+    Checkpoint, CstM, StateTransferProtocol, STPollResult, STResult, STTimeoutResult,
+};
+use atlas_smr_core::state_transfer::monolithic_state::{
+    MonolithicStateTransfer, MonolithicStateTransferInitializer,
+};
+use atlas_smr_core::state_transfer::networking::StateTransferSendNode;
 
 use crate::config::StateTransferConfig;
 use crate::message::{CstMessage, CstMessageKind};
 use crate::message::serialize::CSTMsg;
 use crate::metrics::STATE_TRANSFER_STATE_INSTALL_CLONE_TIME_ID;
 
-pub mod message;
 pub mod config;
+pub mod message;
 pub mod metrics;
 
 /// The state of the checkpoint
@@ -102,12 +102,8 @@ pub struct RecoveryState<S> {
 
 impl<S> RecoveryState<S> {
     /// Creates a new `RecoveryState`.
-    pub fn new(
-        checkpoint: Arc<ReadOnly<Checkpoint<S>>>,
-    ) -> Self {
-        Self {
-            checkpoint,
-        }
+    pub fn new(checkpoint: Arc<ReadOnly<Checkpoint<S>>>) -> Self {
+        Self { checkpoint }
     }
 
     /// Returns the local checkpoint of this recovery state.
@@ -135,7 +131,9 @@ struct ReceivedStateCid {
 /// The implementation is based on the paper «On the Efﬁciency of
 /// Durable State Machine Replication», by A. Bessani et al.
 pub struct CollabStateTransfer<S, NT, PL>
-    where S: MonolithicState + 'static {
+where
+    S: MonolithicState + 'static,
+{
     curr_seq: SeqNo,
     current_checkpoint_state: CheckpointState<S>,
     base_timeout: Duration,
@@ -230,15 +228,18 @@ macro_rules! getmessage {
     }};
 }
 
-impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, PL>
-    where S: MonolithicState + 'static,
-          PL: MonolithicStateLog<S> + 'static,
-          NT: StateTransferSendNode<CSTMsg<S>> + 'static
+impl<S, NT, PL> StateTransferProtocol<S> for CollabStateTransfer<S, NT, PL>
+where
+    S: MonolithicState + 'static,
+    PL: MonolithicStateLog<S> + 'static,
+    NT: StateTransferSendNode<CSTMsg<S>> + 'static,
 {
     type Serialization = CSTMsg<S>;
 
     fn request_latest_state<V>(&mut self, view: V) -> Result<()>
-        where V: NetworkView {
+    where
+        V: NetworkView,
+    {
         self.request_latest_consensus_seq_no::<V>(view);
 
         Ok(())
@@ -248,12 +249,23 @@ impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, 
         Ok(STPollResult::ReceiveMsg)
     }
 
-    fn handle_off_ctx_message<V>(&mut self, view: V, message: StoredMessage<CstM<Self::Serialization>>)
-                                 -> Result<()>
-        where V: NetworkView {
+    fn handle_off_ctx_message<V>(
+        &mut self,
+        view: V,
+        message: StoredMessage<CstM<Self::Serialization>>,
+    ) -> Result<()>
+    where
+        V: NetworkView,
+    {
         let (header, message) = message.into_inner();
 
-        debug!("{:?} // Off context Message {:?} from {:?} with seq {:?}", self.node.id(), message, header.from(), message.sequence_number());
+        debug!(
+            "{:?} // Off context Message {:?} from {:?} with seq {:?}",
+            self.node.id(),
+            message,
+            header.from(),
+            message.sequence_number()
+        );
 
         match &message.kind() {
             CstMessageKind::RequestStateCid => {
@@ -269,28 +281,39 @@ impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, 
             _ => {}
         }
 
-        let status = self.process_message(
-            view,
-            CstProgress::Message(header, message),
-        );
+        let status = self.process_message(view, CstProgress::Message(header, message));
 
         match status {
             CstStatus::Nil => (),
-// should not happen...
+            // should not happen...
             _ => {
-                return Err(anyhow!(format!("Invalid state reached while state transfer processing message! {:?}", status)));
+                return Err(anyhow!(format!(
+                    "Invalid state reached while state transfer processing message! {:?}",
+                    status
+                )));
             }
         }
 
         Ok(())
     }
 
-    fn process_message<V>(&mut self, view: V,
-                          message: StoredMessage<CstM<Self::Serialization>>)
-                          -> Result<STResult> where V: NetworkView {
+    fn process_message<V>(
+        &mut self,
+        view: V,
+        message: StoredMessage<CstM<Self::Serialization>>,
+    ) -> Result<STResult>
+    where
+        V: NetworkView,
+    {
         let (header, message) = message.into_inner();
 
-        debug!("{:?} // Message {:?} from {:?} while in phase {:?}", self.node.id(), message, header.from(), self.phase);
+        debug!(
+            "{:?} // Message {:?} from {:?} while in phase {:?}",
+            self.node.id(),
+            message,
+            header.from(),
+            self.phase
+        );
 
         match &message.kind() {
             CstMessageKind::RequestStateCid => {
@@ -307,21 +330,25 @@ impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, 
         }
 
         // Notify timeouts that we have received this message
-        self.timeouts.received_cst_request(header.from(), message.sequence_number());
+        self.timeouts
+            .received_cst_request(header.from(), message.sequence_number());
 
-        let status = self.process_message(view.clone(),
-                                          CstProgress::Message(header, message), );
+        let status = self.process_message(view.clone(), CstProgress::Message(header, message));
 
         match status {
             CstStatus::Running => (),
             CstStatus::State(state) => {
                 let start = Instant::now();
 
-                self.install_channel.send_return(InstallStateMessage::new(state.checkpoint.state().clone())).unwrap();
+                self.install_channel
+                    .send_return(InstallStateMessage::new(state.checkpoint.state().clone()))
+                    .unwrap();
 
                 metric_duration(STATE_TRANSFER_STATE_INSTALL_CLONE_TIME_ID, start.elapsed());
 
-                return Ok(STResult::StateTransferFinished(state.checkpoint.sequence_number()));
+                return Ok(STResult::StateTransferFinished(
+                    state.checkpoint.sequence_number(),
+                ));
             }
             CstStatus::SeqNo(seq) => {
                 if self.current_checkpoint_state.sequence_number() < seq {
@@ -329,7 +356,12 @@ impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, 
 
                     self.request_latest_state(view);
                 } else {
-                    debug!("{:?} // Not installing sequence number nor requesting state {:?} {:?}", self.node.id(), self.current_checkpoint_state.sequence_number(), seq);
+                    debug!(
+                        "{:?} // Not installing sequence number nor requesting state {:?} {:?}",
+                        self.node.id(),
+                        self.current_checkpoint_state.sequence_number(),
+                        seq
+                    );
 
                     return Ok(STResult::StateTransferNotNeeded(seq));
                 }
@@ -359,9 +391,9 @@ impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, 
             CheckpointState::Complete(earlier) => {
                 CheckpointState::PartialWithEarlier { seq, earlier }
             }
-// FIXME: this may not be an invalid state after all; we may just be generating
-// checkpoints too fast for the execution layer to keep up, delivering the
-// hash digests of the appstate
+            // FIXME: this may not be an invalid state after all; we may just be generating
+            // checkpoints too fast for the execution layer to keep up, delivering the
+            // hash digests of the appstate
             _ => {
                 error!("Invalid checkpoint state detected");
 
@@ -375,10 +407,12 @@ impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, 
     }
 
     fn handle_timeout<V>(&mut self, view: V, timeout: Vec<RqTimeout>) -> Result<STTimeoutResult>
-        where V: NetworkView {
+    where
+        V: NetworkView,
+    {
         for cst_seq in timeout {
             if let TimeoutKind::Cst(cst_seq) = cst_seq.timeout_kind() {
-                if self.cst_request_timed_out(cst_seq.clone(), view.clone()) {
+                if self.cst_request_timed_out(*cst_seq, view.clone()) {
                     return Ok(STTimeoutResult::RunCst);
                 }
             }
@@ -388,24 +422,18 @@ impl<S, NT, PL> StateTransferProtocol<S, NT, PL> for CollabStateTransfer<S, NT, 
     }
 }
 
-impl<S, NT, PL> MonolithicStateTransfer<S, NT, PL> for CollabStateTransfer<S, NT, PL>
-    where S: MonolithicState + 'static,
-          PL: MonolithicStateLog<S> + 'static,
-          NT: StateTransferSendNode<CSTMsg<S>> + 'static {
+impl<S, NT, PL> MonolithicStateTransfer<S> for CollabStateTransfer<S, NT, PL>
+where
+    S: MonolithicState + 'static,
+    PL: MonolithicStateLog<S> + 'static,
+    NT: StateTransferSendNode<CSTMsg<S>> + 'static,
+{
     type Config = StateTransferConfig;
 
-    fn initialize(config: Self::Config, timeouts: Timeouts, node: Arc<NT>,
-                  log: PL, executor_handle: ChannelSyncTx<InstallStateMessage<S>>) -> Result<Self>
-        where Self: Sized {
-        let StateTransferConfig {
-            timeout_duration
-        } = config;
-
-
-        Ok(Self::new(node, timeout_duration, timeouts, log, executor_handle))
-    }
-
-    fn handle_state_received_from_app(&mut self, state: Arc<ReadOnly<Checkpoint<S>>>) -> Result<()> {
+    fn handle_state_received_from_app(
+        &mut self,
+        state: Arc<ReadOnly<Checkpoint<S>>>,
+    ) -> Result<()> {
         self.finalize_checkpoint(state)?;
 
         if self.needs_checkpoint() {
@@ -416,17 +444,53 @@ impl<S, NT, PL> MonolithicStateTransfer<S, NT, PL> for CollabStateTransfer<S, NT
     }
 }
 
-type Ser<ST: StateTransferProtocol<S, NT, PL>, S, NT, PL> = <ST as StateTransferProtocol<S, NT, PL>>::Serialization;
+impl<S, NT, PL> MonolithicStateTransferInitializer<S, NT, PL> for CollabStateTransfer<S, NT, PL>
+where
+    S: MonolithicState + 'static,
+    PL: MonolithicStateLog<S> + 'static,
+    NT: StateTransferSendNode<CSTMsg<S>> + 'static,
+{
+    fn initialize(
+        config: Self::Config,
+        timeouts: Timeouts,
+        node: Arc<NT>,
+        log: PL,
+        executor_handle: ChannelSyncTx<InstallStateMessage<S>>,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+        NT: StateTransferSendNode<Self::Serialization>,
+        PL: MonolithicStateLog<S>,
+    {
+        let StateTransferConfig { timeout_duration } = config;
+
+        Ok(Self::new(
+            node,
+            timeout_duration,
+            timeouts,
+            log,
+            executor_handle,
+        ))
+    }
+}
+
+type Ser<ST, S> = <ST as StateTransferProtocol<S>>::Serialization;
 
 // TODO: request timeouts
 impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
-    where
-        S: MonolithicState + 'static,
-        PL: MonolithicStateLog<S> + 'static,
-        NT: StateTransferSendNode<CSTMsg<S>> + 'static
+where
+    S: MonolithicState + 'static,
+    PL: MonolithicStateLog<S> + 'static,
+    NT: StateTransferSendNode<CSTMsg<S>> + 'static,
 {
     /// Create a new instance of `CollabStateTransfer`.
-    pub fn new(node: Arc<NT>, base_timeout: Duration, timeouts: Timeouts, persistent_log: PL, install_channel: ChannelSyncTx<InstallStateMessage<S>>) -> Self {
+    pub fn new(
+        node: Arc<NT>,
+        base_timeout: Duration,
+        timeouts: Timeouts,
+        persistent_log: PL,
+        install_channel: ChannelSyncTx<InstallStateMessage<S>>,
+    ) -> Self {
         Self {
             current_checkpoint_state: CheckpointState::None,
             base_timeout,
@@ -450,38 +514,33 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
         matches!(self.phase, ProtoPhase::WaitingCheckpoint(_))
     }
 
-    fn process_request_seq<>(
-        &mut self,
-        header: Header,
-        message: CstMessage<S>)
-        where {
+    fn process_request_seq(&mut self, header: Header, message: CstMessage<S>) {
         let seq = match &self.current_checkpoint_state {
-            CheckpointState::PartialWithEarlier { seq, earlier, } => {
-                Some((earlier.sequence_number(), earlier.digest().clone()))
+            CheckpointState::PartialWithEarlier { seq: _, earlier } => {
+                Some((earlier.sequence_number(), *earlier.digest()))
             }
-            CheckpointState::Complete(seq) => {
-                Some((seq.sequence_number(), seq.digest().clone()))
-            }
-            _ => {
-                None
-            }
+            CheckpointState::Complete(seq) => Some((seq.sequence_number(), *seq.digest())),
+            _ => None,
         };
 
-        let kind = CstMessageKind::ReplyStateCid(seq.clone());
+        let kind = CstMessageKind::ReplyStateCid(seq);
 
         let reply = CstMessage::new(message.sequence_number(), kind);
 
-        debug!("{:?} // Replying to {:?} seq {:?} with seq no {:?}", self.node.id(),
-            header.from(), message.sequence_number(), seq);
+        debug!(
+            "{:?} // Replying to {:?} seq {:?} with seq no {:?}",
+            self.node.id(),
+            header.from(),
+            message.sequence_number(),
+            seq
+        );
 
-        self.node.send(reply, header.from(), true);
+        let _ = self.node.send_signed(reply, header.from(), true);
     }
-
 
     /// Process the entire list of pending state transfer requests
     /// This will only reply to the latest request sent by each of the replicas
-    fn process_pending_state_requests(&mut self)
-        where {
+    fn process_pending_state_requests(&mut self) {
         let waiting = std::mem::replace(&mut self.phase, ProtoPhase::Init);
 
         if let ProtoPhase::WaitingCheckpoint(reqs) = waiting {
@@ -489,7 +548,9 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
 
             for request in reqs {
                 // We only want to reply to the most recent requests from each of the nodes
-                if map.contains_key(&request.header().from()) {
+                if let std::collections::hash_map::Entry::Vacant(e) = map.entry(request.header().from()) {
+                    e.insert(request);
+                } else {
                     map.entry(request.header().from()).and_modify(|x| {
                         if x.message().sequence_number() < request.message().sequence_number() {
                             //Dispose of the previous request
@@ -498,8 +559,6 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                     });
 
                     continue;
-                } else {
-                    map.insert(request.header().from(), request);
                 }
             }
 
@@ -511,12 +570,7 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
         }
     }
 
-    fn process_request_state(
-        &mut self,
-        header: Header,
-        message: CstMessage<S>,
-    ) where
-    {
+    fn process_request_state(&mut self, header: Header, message: CstMessage<S>) {
         match &mut self.phase {
             ProtoPhase::Init => {}
             ProtoPhase::WaitingCheckpoint(waiting) => {
@@ -531,15 +585,14 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
         }
 
         let state = match &self.current_checkpoint_state {
-            CheckpointState::PartialWithEarlier { earlier, seq } => { earlier.clone() }
-            CheckpointState::Complete(checkpoint) => {
-                checkpoint.clone()
-            }
+            CheckpointState::PartialWithEarlier { earlier, seq: _ } => earlier.clone(),
+            CheckpointState::Complete(checkpoint) => checkpoint.clone(),
             _ => {
                 if let ProtoPhase::WaitingCheckpoint(waiting) = &mut self.phase {
                     waiting.push(StoredMessage::new(header, message));
                 } else {
-                    self.phase = ProtoPhase::WaitingCheckpoint(vec![StoredMessage::new(header, message)]);
+                    self.phase =
+                        ProtoPhase::WaitingCheckpoint(vec![StoredMessage::new(header, message)]);
                 }
 
                 return;
@@ -548,21 +601,16 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
 
         let reply = CstMessage::new(
             message.sequence_number(),
-            CstMessageKind::ReplyState(RecoveryState {
-                checkpoint: state,
-            }),
+            CstMessageKind::ReplyState(RecoveryState { checkpoint: state }),
         );
 
-        self.node.send(reply, header.from(), true).unwrap();
+        self.node.send_signed(reply, header.from(), true).unwrap();
     }
 
     /// Advances the state of the CST state machine.
-    pub fn process_message<V>(
-        &mut self,
-        view: V,
-        progress: CstProgress<S>,
-    ) -> CstStatus<S>
-        where V: NetworkView
+    pub fn process_message<V>(&mut self, view: V, progress: CstProgress<S>) -> CstStatus<S>
+    where
+        V: NetworkView,
     {
         match self.phase {
             ProtoPhase::WaitingCheckpoint(_) => {
@@ -598,7 +646,12 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
 
                 // drop cst messages with invalid seq no
                 if message.sequence_number() != self.curr_seq {
-                    debug!("{:?} // Wait what? {:?} {:?}", self.node.id(), self.curr_seq, message.sequence_number());
+                    debug!(
+                        "{:?} // Wait what? {:?} {:?}",
+                        self.node.id(),
+                        self.curr_seq,
+                        message.sequence_number()
+                    );
                     // FIXME: how to handle old or newer messages?
                     // BFT-SMaRt simply ignores messages with a
                     // value of `queryID` different from the current
@@ -615,27 +668,44 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                             debug!("{:?} // Received state cid {:?} with digest {:?} from {:?} with seq {:?}",
                             self.node.id(), state_cid, digest, header.from(), cid);
 
-                            let received_state_cid = self.received_state_ids.entry(digest.clone()).or_insert_with(|| {
-                                ReceivedStateCid {
+                            let currently_active_states = self
+                                .received_state_ids
+                                .entry(*digest)
+                                .or_insert_with(|| ReceivedStateCid {
                                     cid: *cid,
                                     count: 0,
+                                });
+
+                            match (*cid).cmp(&currently_active_states.cid) {
+                                Ordering::Greater => {
+                                    info!("{:?} // Received newer state for old cid {:?} vs new cid {:?} with digest {:?}.",
+                                    self.node.id(), currently_active_states.cid, *cid, digest);
+
+                                    currently_active_states.cid = *cid;
+                                    currently_active_states.count = 1;
                                 }
-                            });
+                                Ordering::Equal => {
+                                    info!("{:?} // Received matching state for cid {:?} with digest {:?}. Count {}",
+                                self.node.id(), currently_active_states.cid, digest, currently_active_states.count + 1);
 
-                            if *cid > received_state_cid.cid {
-                                info!("{:?} // Received newer state for old cid {:?} vs new cid {:?} with digest {:?}.",
-                                    self.node.id(), received_state_cid.cid, *cid, digest);
-
-                                received_state_cid.cid = *cid;
-                                received_state_cid.count = 1;
-                            } else if *cid == received_state_cid.cid {
-                                info!("{:?} // Received matching state for cid {:?} with digest {:?}. Count {}",
-                                self.node.id(), received_state_cid.cid, digest, received_state_cid.count + 1);
-
-                                received_state_cid.count += 1;
+                                    currently_active_states.count += 1;
+                                }
+                                _ => {
+                                    debug!(
+                                        "{:?} // Received older state cid {:?} vs new cid {:?} with digest {:?}.",
+                                        self.node.id(),
+                                        currently_active_states.cid,
+                                        *cid,
+                                        digest
+                                    );
+                                }
                             }
                         } else {
-                            debug!("{:?} // Received blank state cid from node {:?}", self.node.id(), header.from());
+                            debug!(
+                                "{:?} // Received blank state cid from node {:?}",
+                                self.node.id(),
+                                header.from()
+                            );
                         }
                     }
                     CstMessageKind::RequestStateCid => {
@@ -658,9 +728,14 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                 // TODO: check for more than one reply from the same node
                 let i = i + 1;
 
-                debug!("{:?} // Quorum count {}, i: {}, cst_seq {:?}. Current Latest Cid: {:?}",
-                        self.node.id(), view.quorum(), i,
-                        self.curr_seq, self.received_state_ids);
+                debug!(
+                    "{:?} // Quorum count {}, i: {}, cst_seq {:?}. Current Latest Cid: {:?}",
+                    self.node.id(),
+                    view.quorum(),
+                    i,
+                    self.curr_seq,
+                    self.received_state_ids
+                );
 
                 if i >= view.quorum() {
                     self.phase = ProtoPhase::Init;
@@ -668,13 +743,14 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                     // reset timeout, since req was successful
                     self.curr_timeout = self.base_timeout;
 
-                    let mut received_state_ids: Vec<_> = self.received_state_ids.iter().map(|(digest, cid)| {
-                        (digest, cid.cid, cid.count)
-                    }).collect();
+                    let mut received_state_ids: Vec<_> = self
+                        .received_state_ids
+                        .iter()
+                        .map(|(digest, cid)| (digest, cid.cid, cid.count))
+                        .collect();
 
-                    received_state_ids.sort_by(|(_, _, count), (_, _, count2)| {
-                        count.cmp(count2).reverse()
-                    });
+                    received_state_ids
+                        .sort_by(|(_, _, count), (_, _, count2)| count.cmp(count2).reverse());
 
                     if let Some((digest, seq, count)) = received_state_ids.first() {
                         if *count >= view.quorum() {
@@ -702,7 +778,7 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                 CstStatus::Running
             }
             ProtoPhase::ReceivingState(i) => {
-                let (header, mut message) = getmessage!(progress, CstStatus::RequestState);
+                let (_header, mut message) = getmessage!(progress, CstStatus::RequestState);
 
                 if message.sequence_number() != self.curr_seq {
                     // NOTE: check comment above, on ProtoPhase::ReceivingCid
@@ -715,15 +791,22 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                     None => return CstStatus::Running,
                 };
 
-                let state_digest = state.checkpoint.digest().clone();
+                let state_digest = *state.checkpoint.digest();
 
-                debug!("{:?} // Received state with digest {:?}, is contained in map? {}", self.node.id(),
-                state_digest, self.received_states.contains_key(&state_digest));
+                debug!(
+                    "{:?} // Received state with digest {:?}, is contained in map? {}",
+                    self.node.id(),
+                    state_digest,
+                    self.received_states.contains_key(&state_digest)
+                );
 
-                if self.received_states.contains_key(&state_digest) {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.received_states.entry(state_digest) {
+                    e.insert(ReceivedState { count: 1, state });
+                } else {
                     let current_state = self.received_states.get_mut(&state_digest).unwrap();
 
-                    let current_state_seq: SeqNo = current_state.state.checkpoint().sequence_number();
+                    let current_state_seq: SeqNo =
+                        current_state.state.checkpoint().sequence_number();
                     let recv_state_seq: SeqNo = state.checkpoint().sequence_number();
 
                     match recv_state_seq.cmp(&current_state_seq) {
@@ -741,8 +824,6 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                             current_state.count += 1;
                         }
                     }
-                } else {
-                    self.received_states.insert(state_digest, ReceivedState { count: 1, state });
                 }
 
                 // check if we have gathered enough state
@@ -765,12 +846,15 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                     let received_state = self.received_states.iter().max_by_key(|(_, st)| st.count);
 
                     match received_state {
-                        Some((digest, _)) => digest.clone(),
+                        Some((digest, _)) => *digest,
                         None => {
                             return if i >= view.quorum() {
                                 self.received_states.clear();
 
-                                debug!("{:?} // No matching states found, clearing", self.node.id());
+                                debug!(
+                                    "{:?} // No matching states found, clearing",
+                                    self.node.id()
+                                );
                                 CstStatus::RequestState
                             } else {
                                 CstStatus::Running
@@ -801,7 +885,11 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
                         CstStatus::State(state)
                     }
                     _ => {
-                        debug!("{:?} // No states with more than f {} count", self.node.id(), f);
+                        debug!(
+                            "{:?} // No states with more than f {} count",
+                            self.node.id(),
+                            f
+                        );
 
                         CstStatus::RequestState
                     }
@@ -810,14 +898,15 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
         }
     }
 
-
     /// End the state of an on-going checkpoint.
     ///
     /// This method should only be called when `finalize_request()` reports
     /// `Info::BeginCheckpoint`, and the requested application state is received
     /// on the core server task's master channel.
-    pub fn finalize_checkpoint(&mut self, checkpoint: Arc<ReadOnly<Checkpoint<S>>>) -> Result<()> where
-        PL: MonolithicStateLog<S> {
+    pub fn finalize_checkpoint(&mut self, checkpoint: Arc<ReadOnly<Checkpoint<S>>>) -> Result<()>
+    where
+        PL: MonolithicStateLog<S>,
+    {
         match &self.current_checkpoint_state {
             CheckpointState::None => {
                 Err!(StateTransferError::CheckpointNotInitiated)
@@ -825,12 +914,14 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
             CheckpointState::Complete(_) => {
                 Err!(StateTransferError::CheckpointAlreadyFinalized)
             }
-            CheckpointState::Partial { seq: _ } | CheckpointState::PartialWithEarlier { seq: _, .. } => {
+            CheckpointState::Partial { seq: _ }
+            | CheckpointState::PartialWithEarlier { seq: _, .. } => {
                 let checkpoint_state = CheckpointState::Complete(checkpoint.clone());
 
                 self.current_checkpoint_state = checkpoint_state;
 
-                self.persistent_log.write_checkpoint(OperationMode::NonBlockingSync(None), checkpoint)?;
+                self.persistent_log
+                    .write_checkpoint(OperationMode::NonBlockingSync(None), checkpoint)?;
 
                 Ok(())
             }
@@ -851,7 +942,9 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
     /// Returns a bool to signify if we must move to the Retrieving state
     /// If the timeout is no longer relevant, returns false (Can remain in current phase)
     pub fn cst_request_timed_out<V>(&mut self, seq: SeqNo, view: V) -> bool
-        where V: NetworkView {
+    where
+        V: NetworkView,
+    {
         let status = self.timed_out(seq);
 
         match status {
@@ -902,10 +995,9 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
 
     /// Used by a recovering node to retrieve the latest sequence number
     /// attributed to a client request by the consensus layer.
-    pub fn request_latest_consensus_seq_no<V>(
-        &mut self,
-        view: V,
-    ) where V: NetworkView
+    pub fn request_latest_consensus_seq_no<V>(&mut self, view: V)
+    where
+        V: NetworkView,
     {
         // Reset the map of received state ids
         self.received_state_ids.clear();
@@ -914,28 +1006,32 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
 
         let cst_seq = self.curr_seq();
 
-        info!("{:?} // Requesting latest state seq no with seq {:?}", self.node.id(), cst_seq);
+        info!(
+            "{:?} // Requesting latest state seq no with seq {:?}",
+            self.node.id(),
+            cst_seq
+        );
 
-        self.timeouts.timeout_cst_request(self.curr_timeout,
-                                          view.quorum() as u32,
-                                          cst_seq);
+        self.timeouts
+            .timeout_cst_request(self.curr_timeout, view.quorum() as u32, cst_seq);
 
         self.phase = ProtoPhase::ReceivingCid(0);
 
-        let message = CstMessage::new(
-            cst_seq,
-            CstMessageKind::RequestStateCid,
-        );
+        let message = CstMessage::new(cst_seq, CstMessageKind::RequestStateCid);
 
-        let targets = view.quorum_members().clone().into_iter().filter(|id| *id != self.node.id());
+        let targets = view
+            .quorum_members()
+            .clone()
+            .into_iter()
+            .filter(|id| *id != self.node.id());
 
-        self.node.broadcast(message, targets);
+        let _ = self.node.broadcast_signed(message, targets);
     }
 
     /// Used by a recovering node to retrieve the latest state.
-    pub fn request_latest_state<V>(
-        &mut self, view: V,
-    ) where V: NetworkView
+    pub fn request_latest_state<V>(&mut self, view: V)
+    where
+        V: NetworkView,
     {
         // reset hashmap of received states
         self.received_states.clear();
@@ -944,42 +1040,42 @@ impl<S, NT, PL> CollabStateTransfer<S, NT, PL>
 
         let cst_seq = self.curr_seq();
 
-        info!("{:?} // Requesting latest state with cst msg seq {:?}", self.node.id(), cst_seq);
+        info!(
+            "{:?} // Requesting latest state with cst msg seq {:?}",
+            self.node.id(),
+            cst_seq
+        );
 
-        self.timeouts.timeout_cst_request(self.curr_timeout,
-                                          view.quorum() as u32,
-                                          cst_seq);
+        self.timeouts
+            .timeout_cst_request(self.curr_timeout, view.quorum() as u32, cst_seq);
 
         self.phase = ProtoPhase::ReceivingState(0);
 
         //TODO: Maybe attempt to use followers to rebuild state and avoid
         // Overloading the replicas
         let message = CstMessage::new(cst_seq, CstMessageKind::RequestState);
-        let targets = view.quorum_members().clone().into_iter().filter(|id| *id != self.node.id());
+        let targets = view
+            .quorum_members()
+            .clone()
+            .into_iter()
+            .filter(|id| *id != self.node.id());
 
-        self.node.broadcast(message, targets);
+        let _ = self.node.broadcast_signed(message, targets);
     }
 }
 
-impl<S, NT, PL> PersistableStateTransferProtocol for CollabStateTransfer<S, NT, PL>
-    where S: MonolithicState + 'static {}
-
+impl<S, NT, PL> PersistableStateTransferProtocol for CollabStateTransfer<S, NT, PL> where
+    S: MonolithicState + 'static
+{
+}
 
 impl<S> Orderable for CheckpointState<S> {
     fn sequence_number(&self) -> SeqNo {
         match self {
-            CheckpointState::None => {
-                SeqNo::ZERO
-            }
-            CheckpointState::Partial { seq } => {
-                SeqNo::ZERO
-            }
-            CheckpointState::PartialWithEarlier { earlier, .. } => {
-                earlier.sequence_number()
-            }
-            CheckpointState::Complete(arc) => {
-                arc.sequence_number()
-            }
+            CheckpointState::None => SeqNo::ZERO,
+            CheckpointState::Partial { seq: _ } => SeqNo::ZERO,
+            CheckpointState::PartialWithEarlier { earlier, .. } => earlier.sequence_number(),
+            CheckpointState::Complete(arc) => arc.sequence_number(),
         }
     }
 }
@@ -989,5 +1085,5 @@ pub enum StateTransferError {
     #[error("The checkpoint has already been finalized")]
     CheckpointAlreadyFinalized,
     #[error("No checkpoint has been initiated yet")]
-    CheckpointNotInitiated
+    CheckpointNotInitiated,
 }

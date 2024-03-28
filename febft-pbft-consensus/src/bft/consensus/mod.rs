@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, BTreeMap, BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use either::Either;
 use event_listener::Event;
@@ -11,29 +11,32 @@ use atlas_common::error::*;
 use atlas_common::globals::ReadOnly;
 use atlas_common::maybe_vec::MaybeVec;
 use atlas_common::node_id::NodeId;
-use atlas_common::ordering::{Orderable, SeqNo, tbo_advance_message_queue, tbo_advance_message_queue_return, tbo_queue_message_arc};
+use atlas_common::ordering::{
+    tbo_advance_message_queue, tbo_advance_message_queue_return, tbo_queue_message_arc, Orderable,
+    SeqNo,
+};
+use atlas_common::serialization_helper::SerType;
 use atlas_communication::message::{Header, StoredMessage};
-use atlas_core::messages::{ClientRqInfo, StoredRequestMessage};
-use atlas_core::ordering_protocol::Decision;
+use atlas_core::messages::{ClientRqInfo, SessionBased};
 use atlas_core::ordering_protocol::networking::OrderProtocolSendNode;
-use atlas_core::smr::smr_decision_log::ShareableMessage;
+use atlas_core::ordering_protocol::{Decision, ShareableMessage};
 use atlas_core::timeouts::Timeouts;
 use atlas_metrics::metrics::metric_increment;
-use atlas_smr_application::ExecutorHandle;
-use atlas_smr_application::serialize::ApplicationData;
 
-use crate::bft::{OPDecision, PBFT, SysMsg};
-use crate::bft::consensus::decision::{ConsensusDecision, DecisionPollStatus, DecisionStatus, MessageQueue};
+use crate::bft::consensus::decision::{
+    ConsensusDecision, DecisionPollStatus, DecisionStatus, MessageQueue,
+};
 use crate::bft::log::deciding::CompletedBatch;
 use crate::bft::log::decisions::{IncompleteProof, Proof, ProofMetadata};
 use crate::bft::log::Log;
 use crate::bft::message::{ConsensusMessage, ConsensusMessageKind, PBFTMessage};
-use crate::bft::metric::OPERATIONS_PROCESSED_ID;
-use crate::bft::sync::Synchronizer;
+use crate::bft::metric::OPERATIONS_ORDERED_ID;
 use crate::bft::sync::view::ViewInfo;
+use crate::bft::sync::Synchronizer;
+use crate::bft::{OPDecision, SysMsg, PBFT};
 
-pub mod decision;
 pub mod accessory;
+pub mod decision;
 
 #[derive(Debug)]
 /// Status returned from processing a consensus message.
@@ -117,15 +120,14 @@ impl<O> TboQueue<O> {
         self.curr_seq = self.curr_seq.next();
 
         let pre_prepares = tbo_advance_message_queue_return(&mut self.pre_prepares)
-            .unwrap_or_else(|| VecDeque::new());
-        let prepares = tbo_advance_message_queue_return(&mut self.prepares)
-            .unwrap_or_else(|| VecDeque::new());
-        let commits = tbo_advance_message_queue_return(&mut self.commits)
-            .unwrap_or_else(|| VecDeque::new());
+            .unwrap_or_default();
+        let prepares =
+            tbo_advance_message_queue_return(&mut self.prepares).unwrap_or_default();
+        let commits =
+            tbo_advance_message_queue_return(&mut self.commits).unwrap_or_default();
 
         MessageQueue::from_messages(pre_prepares, prepares, commits)
     }
-
 
     /// Advances the message queue, and updates the consensus instance id.
     fn next_instance_queue(&mut self) {
@@ -158,13 +160,21 @@ impl<O> TboQueue<O> {
     /// Queues a `PREPARE` message for later processing, or drops it
     /// immediately if it pertains to an older consensus instance.
     fn queue_prepare(&mut self, message: ShareableMessage<PBFTMessage<O>>) {
-        tbo_queue_message_arc(self.base_seq(), &mut self.prepares, (message.sequence_number(), message))
+        tbo_queue_message_arc(
+            self.base_seq(),
+            &mut self.prepares,
+            (message.sequence_number(), message),
+        )
     }
 
     /// Queues a `COMMIT` message for later processing, or drops it
     /// immediately if it pertains to an older consensus instance.
     fn queue_commit(&mut self, message: ShareableMessage<PBFTMessage<O>>) {
-        tbo_queue_message_arc(self.base_seq(), &mut self.commits, (message.sequence_number(), message))
+        tbo_queue_message_arc(
+            self.base_seq(),
+            &mut self.commits,
+            (message.sequence_number(), message),
+        )
     }
 
     /// Clear this queue
@@ -188,11 +198,11 @@ pub struct Signals {
 
 /// The consensus handler. Responsible for multiplexing consensus instances and keeping track
 /// of missing messages
-pub struct Consensus<D, >
-    where D: ApplicationData + 'static, {
+pub struct Consensus<RQ>
+where
+    RQ: SerType,
+{
     node_id: NodeId,
-    /// The handle to the executor of the function
-    executor_handle: ExecutorHandle<D>,
     /// How many consensus instances can we overlap at the same time.
     watermark: u32,
     /// The current seq no that we are currently in
@@ -204,14 +214,14 @@ pub struct Consensus<D, >
     /// The consensus instances that are currently being processed
     /// A given consensus instance n will only be finished when all consensus instances
     /// j, where j < n have already been processed, in order to maintain total ordering
-    decisions: VecDeque<ConsensusDecision<D>>,
+    decisions: VecDeque<ConsensusDecision<RQ>>,
     /// The queue for messages that sit outside the range seq_no + watermark
     /// These messages cannot currently be processed since they sit outside the allowed
     /// zone but they will be processed once the seq no moves forward enough to include them
-    tbo_queue: TboQueue<D::Request>,
+    tbo_queue: TboQueue<RQ>,
     /// This queue serves for us to keep track of messages we receive of coming up views.
     /// This is important for us to be able to continue the process of moving views after a view change
-    view_queue: VecDeque<Vec<ShareableMessage<PBFTMessage<D::Request>>>>,
+    view_queue: VecDeque<Vec<ShareableMessage<PBFTMessage<RQ>>>>,
     /// The consensus guard that will be used to ensure that the proposer only proposes one batch
     /// for each consensus instance
     consensus_guard: Arc<ProposerConsensusGuard>,
@@ -221,14 +231,22 @@ pub struct Consensus<D, >
     is_recovering: bool,
 }
 
-impl<D> Consensus<D> where D: ApplicationData + 'static {
-    pub fn new_replica(node_id: NodeId, view: &ViewInfo, executor_handle: ExecutorHandle<D>, seq_no: SeqNo,
-                       watermark: u32, consensus_guard: Arc<ProposerConsensusGuard>, timeouts: Timeouts) -> Self {
+impl<RQ> Consensus<RQ>
+where
+    RQ: SerType + SessionBased + 'static,
+{
+    pub fn new_replica(
+        node_id: NodeId,
+        view: &ViewInfo,
+        seq_no: SeqNo,
+        watermark: u32,
+        consensus_guard: Arc<ProposerConsensusGuard>,
+        timeouts: Timeouts,
+    ) -> Self {
         let mut curr_seq = seq_no;
 
         let mut consensus = Self {
             node_id,
-            executor_handle,
             watermark,
             seq_no,
             signalled: Signals::new(watermark),
@@ -243,11 +261,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
         // Initialize the consensus instances
         for _ in 0..watermark {
-            let decision = ConsensusDecision::init_decision(
-                node_id,
-                curr_seq,
-                view,
-            );
+            let decision = ConsensusDecision::init_decision(node_id, curr_seq, view);
 
             consensus.enqueue_decision(decision);
 
@@ -258,7 +272,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     }
 
     /// Queue a given message into our message queues.
-    pub fn queue(&mut self, message: ShareableMessage<PBFTMessage<D::Request>>) {
+    pub fn queue(&mut self, message: ShareableMessage<PBFTMessage<RQ>>) {
         let message_seq = message.message().sequence_number();
 
         let view_seq = message.message().consensus().view();
@@ -313,7 +327,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     }
 
     /// Poll the given consensus
-    pub fn poll(&mut self) -> ConsensusPollStatus<D::Request> {
+    pub fn poll(&mut self) -> ConsensusPollStatus<RQ> {
         trace!("Current signal queue: {:?}", self.signalled);
 
         while let Some(seq_no) = self.signalled.pop_signalled() {
@@ -344,7 +358,12 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
                     }
                     _ => {}
                 }
-            } else { error!("Cannot possibly poll sequence number that is in the past {:?} vs current {:?}", seq_no, self.seq_no) }
+            } else {
+                debug!(
+                    "Cannot possibly poll sequence number that is in the past {:?} vs current {:?}",
+                    seq_no, self.seq_no
+                )
+            }
         }
 
         // If the first decision in the queue is decided, then we must finalize it
@@ -359,12 +378,16 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
         ConsensusPollStatus::Recv
     }
 
-    pub fn process_message<NT>(&mut self,
-                               s_message: ShareableMessage<PBFTMessage<D::Request>>,
-                               synchronizer: &Synchronizer<D>,
-                               timeouts: &Timeouts,
-                               node: &Arc<NT>) -> Result<ConsensusStatus<D::Request>>
-        where NT: OrderProtocolSendNode<D, PBFT<D>> + 'static {
+    pub fn process_message<NT>(
+        &mut self,
+        s_message: ShareableMessage<PBFTMessage<RQ>>,
+        synchronizer: &Synchronizer<RQ>,
+        timeouts: &Timeouts,
+        node: &Arc<NT>,
+    ) -> Result<ConsensusStatus<RQ>>
+    where
+        NT: OrderProtocolSendNode<RQ, PBFT<RQ>> + 'static,
+    {
         let (header, message) = (s_message.header(), s_message.message().consensus());
 
         let message_seq = message.sequence_number();
@@ -390,7 +413,12 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
         let i = match message_seq.index(self.seq_no) {
             Either::Right(i) => i,
             Either::Left(_) => {
-                debug!("Message {:?} from {:?} is behind our current sequence no {:?}. Ignoring", message, header.from(), self.seq_no, );
+                debug!(
+                    "Message {:?} from {:?} is behind our current sequence no {:?}. Ignoring",
+                    message,
+                    header.from(),
+                    self.seq_no,
+                );
 
                 return Ok(ConsensusStatus::MessageIgnored);
             }
@@ -399,7 +427,10 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
         if i >= self.decisions.len() {
             // We are not currently processing this consensus instance
             // so we need to queue the message
-            debug!("{:?} // Queueing message {:?} for seq no {:?}", self.node_id, message, message_seq);
+            debug!(
+                "{:?} // Queueing message {:?} for seq no {:?}",
+                self.node_id, message, message_seq
+            );
 
             self.tbo_queue.queue(s_message);
 
@@ -414,12 +445,10 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
         let status = decision.process_message(s_message, synchronizer, timeouts, node)?;
 
         Ok(match status {
-            DecisionStatus::VotedTwice(node) => {
-                ConsensusStatus::VotedTwice(node)
-            }
-            DecisionStatus::Deciding(message) => {
-                ConsensusStatus::Deciding(MaybeVec::from_one(Decision::decision_info_from_message(decision_seq, message)))
-            }
+            DecisionStatus::VotedTwice(node) => ConsensusStatus::VotedTwice(node),
+            DecisionStatus::Deciding(message) => ConsensusStatus::Deciding(MaybeVec::from_one(
+                Decision::decision_info_from_message(decision_seq, message),
+            )),
             DecisionStatus::MessageQueued => {
                 //When we transition phases, we may discover new messages
                 // That were in the queue, so we must be signalled again
@@ -433,22 +462,33 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
                 self.signalled.push_signalled(decision_seq);
 
                 if let Some(metadata) = metadata {
-                    ConsensusStatus::Deciding(MaybeVec::from_one(Decision::decision_info_from_metadata_and_messages(decision_seq, metadata, MaybeVec::from_one(message))))
+                    ConsensusStatus::Deciding(MaybeVec::from_one(
+                        Decision::decision_info_from_metadata_and_messages(
+                            decision_seq,
+                            metadata,
+                            MaybeVec::from_one(message),
+                        ),
+                    ))
                 } else {
-                    ConsensusStatus::Deciding(MaybeVec::from_one(Decision::decision_info_from_message(decision_seq, message)))
+                    ConsensusStatus::Deciding(MaybeVec::from_one(
+                        Decision::decision_info_from_message(decision_seq, message),
+                    ))
                 }
             }
-            DecisionStatus::Decided(message) => {
-                ConsensusStatus::Decided(MaybeVec::from_one(Decision::decision_info_from_message(decision_seq, message)))
-            }
+            DecisionStatus::Decided(message) => ConsensusStatus::Decided(MaybeVec::from_one(
+                Decision::decision_info_from_message(decision_seq, message),
+            )),
             DecisionStatus::DecidedIgnored => ConsensusStatus::Decided(MaybeVec::None),
-            DecisionStatus::MessageIgnored => ConsensusStatus::MessageIgnored
+            DecisionStatus::MessageIgnored => ConsensusStatus::MessageIgnored,
         })
     }
 
     /// Are we able to finalize the next consensus instance on the queue?
     pub fn can_finalize(&self) -> bool {
-        self.decisions.front().map(|d| d.is_finalizeable()).unwrap_or(false)
+        self.decisions
+            .front()
+            .map(|d| d.is_finalizeable())
+            .unwrap_or(false)
     }
 
     pub(super) fn finalizeable_count(&self) -> usize {
@@ -466,8 +506,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     }
 
     /// Finalize the next consensus instance if possible
-    pub fn finalize(&mut self, view: &ViewInfo) -> Result<Option<CompletedBatch<D::Request>>> {
-
+    pub fn finalize(&mut self, view: &ViewInfo) -> Result<Option<CompletedBatch<RQ>>> {
         // If the decision can't be finalized, then we can't finalize the batch
         if let Some(decision) = self.decisions.front() {
             if !decision.is_finalizeable() {
@@ -483,9 +522,14 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
         let batch = decision.finalize()?;
 
-        info!("{:?} // Finalizing consensus instance {:?} with {:?} rqs", self.node_id, batch.sequence_number(), batch.request_count());
+        info!(
+            "{:?} // Finalizing consensus instance {:?} with {:?} rqs",
+            self.node_id,
+            batch.sequence_number(),
+            batch.request_count()
+        );
 
-        metric_increment(OPERATIONS_PROCESSED_ID, Some(batch.request_count() as u64));
+        metric_increment(OPERATIONS_ORDERED_ID, Some(batch.request_count() as u64));
 
         Ok(Some(batch))
     }
@@ -493,7 +537,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     /// Advance to the next instance of the consensus
     /// This will also create the necessary new decision to keep the pending decisions
     /// equal to the water mark
-    pub fn next_instance(&mut self, view: &ViewInfo) -> ConsensusDecision<D> {
+    pub fn next_instance(&mut self, view: &ViewInfo) -> ConsensusDecision<RQ> {
         let decision = self.decisions.pop_front().unwrap();
 
         self.seq_no = self.seq_no.next();
@@ -509,15 +553,16 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
             self.timeouts.cancel_client_rq_timeouts(None);
         }
 
-        let new_seq_no = self.decisions.back()
+        let new_seq_no = self
+            .decisions
+            .back()
             .map(|d| d.sequence_number().next())
             // If the watermark is 1, then the seq no of the
             .unwrap_or(self.seq_no);
 
         // Create the decision to keep the queue populated
-        let novel_decision = ConsensusDecision::init_with_msg_log(self.node_id,
-                                                                  new_seq_no,
-                                                                  view, queue, );
+        let novel_decision =
+            ConsensusDecision::init_with_msg_log(self.node_id, new_seq_no, view, queue);
 
         self.enqueue_decision(novel_decision);
 
@@ -525,7 +570,10 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     }
 
     pub fn install_sequence_number(&mut self, novel_seq_no: SeqNo, view: &ViewInfo) {
-        info!("{:?} // Installing sequence number {:?} vs current {:?}", self.node_id, novel_seq_no, self.seq_no);
+        info!(
+            "{:?} // Installing sequence number {:?} vs current {:?}",
+            self.node_id, novel_seq_no, self.seq_no
+        );
 
         match novel_seq_no.index(self.seq_no) {
             Either::Left(_) => {
@@ -536,12 +584,12 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
                 let mut sequence_no = novel_seq_no;
 
                 while self.decisions.len() < self.watermark as usize {
-                    let novel_decision = ConsensusDecision::init_decision(self.node_id,
-                                                                          sequence_no, view);
+                    let novel_decision =
+                        ConsensusDecision::init_decision(self.node_id, sequence_no, view);
 
                     self.enqueue_decision(novel_decision);
 
-                    sequence_no = sequence_no + SeqNo::ONE;
+                    sequence_no += SeqNo::ONE;
                 }
 
                 self.tbo_queue.curr_seq = novel_seq_no;
@@ -563,7 +611,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
                 let mut sequence_no = novel_seq_no;
 
-                let mut overflow = limit - self.watermark as usize;
+                let overflow = limit - self.watermark as usize;
 
                 if overflow >= self.tbo_queue.pre_prepares.len() {
                     debug!("{:?} // Decision log overflow is larger than the tbo queue. Clearing tbo queue {} vs {}", self.node_id, overflow, self.tbo_queue.pre_prepares.len());
@@ -585,12 +633,23 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
                 /// Get the next few already populated message queues from the tbo queue.
                 /// This will also adjust the tbo queue sequence number to the correct one
-                while self.tbo_queue.sequence_number() < novel_seq_no && self.decisions.len() < self.watermark as usize {
+                while self.tbo_queue.sequence_number() < novel_seq_no
+                    && self.decisions.len() < self.watermark as usize
+                {
                     let messages = self.tbo_queue.advance_queue();
 
-                    let decision = ConsensusDecision::init_with_msg_log(self.node_id, sequence_no, view, messages);
+                    let decision = ConsensusDecision::init_with_msg_log(
+                        self.node_id,
+                        sequence_no,
+                        view,
+                        messages,
+                    );
 
-                    debug!("{:?} // Initialized new decision from TBO queue messages {:?}", self.node_id, decision.sequence_number());
+                    debug!(
+                        "{:?} // Initialized new decision from TBO queue messages {:?}",
+                        self.node_id,
+                        decision.sequence_number()
+                    );
 
                     self.enqueue_decision(decision);
 
@@ -598,7 +657,8 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
                 }
 
                 while self.decisions.len() < self.watermark as usize {
-                    let decision = ConsensusDecision::init_decision(self.node_id, sequence_no, view);
+                    let decision =
+                        ConsensusDecision::init_decision(self.node_id, sequence_no, view);
 
                     self.enqueue_decision(decision);
 
@@ -619,7 +679,8 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
                 // Get the last decision in the decision queue.
                 // The following new consensus decisions will have the sequence number of the last decision
-                let mut sequence_no: SeqNo = self.decisions.back().unwrap().sequence_number().next();
+                let mut sequence_no: SeqNo =
+                    self.decisions.back().unwrap().sequence_number().next();
 
                 debug!("Repopulating decision vec until we reach watermark. Current seq {:?}, current decision len {}, watermark {}", sequence_no, self.decisions.len(), self.watermark);
 
@@ -630,8 +691,12 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
                     // Behaviour
                     let messages = self.tbo_queue.advance_queue();
 
-                    let decision = ConsensusDecision::init_with_msg_log(self.node_id, sequence_no,
-                                                                        view, messages);
+                    let decision = ConsensusDecision::init_with_msg_log(
+                        self.node_id,
+                        sequence_no,
+                        view,
+                        messages,
+                    );
 
                     self.enqueue_decision(decision);
 
@@ -647,15 +712,19 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
         // A couple of assertions to make sure we are good
         assert_eq!(self.tbo_queue.sequence_number(), self.seq_no);
-        assert_eq!(self.decisions.front().unwrap().sequence_number(), self.seq_no);
+        assert_eq!(
+            self.decisions.front().unwrap().sequence_number(),
+            self.seq_no
+        );
     }
 
     /// Catch up to the quorums latest decided consensus
-    pub fn catch_up_to_quorum(&mut self,
-                              view: &ViewInfo,
-                              proof: Proof<D::Request>,
-                              log: &mut Log<D>) -> Result<OPDecision<D::Request>> {
-
+    pub fn catch_up_to_quorum(
+        &mut self,
+        view: &ViewInfo,
+        proof: Proof<RQ>,
+        log: &mut Log<RQ>,
+    ) -> Result<OPDecision<RQ>> {
         // If this is successful, it means that we are all caught up and can now start executing the
         // batch
         let to_execute = log.install_proof(proof)?;
@@ -668,12 +737,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
     /// Create a fake `PRE-PREPARE`. This is useful during the view
     /// change protocol.
-    pub fn forge_propose(
-        &self,
-        requests: Vec<StoredRequestMessage<D::Request>>,
-        view: &ViewInfo,
-    ) -> SysMsg<D>
-    {
+    pub fn forge_propose(&self, requests: Vec<StoredMessage<RQ>>, view: &ViewInfo) -> SysMsg<RQ> {
         PBFTMessage::Consensus(ConsensusMessage::new(
             self.sequence_number(),
             view.sequence_number(),
@@ -683,8 +747,11 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
     /// Install a given view into the current consensus decisions.
     pub fn install_view(&mut self, view: &ViewInfo) {
-        let view_index = match view.sequence_number().index(self.curr_view.sequence_number()) {
-            Either::Right(i) => { i }
+        let view_index = match view
+            .sequence_number()
+            .index(self.curr_view.sequence_number())
+        {
+            Either::Right(i) => i,
             Either::Left(_) => {
                 error!("{:?} // Attempted to install a view that is not ahead of the current view. Ignoring.", self.node_id);
 
@@ -692,7 +759,12 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
             }
         };
 
-        debug!("{:?} // Installing view {:?}, view index: {}", self.node_id, view.sequence_number(), view_index);
+        debug!(
+            "{:?} // Installing view {:?}, view index: {}",
+            self.node_id,
+            view.sequence_number(),
+            view_index
+        );
 
         if view_index == 0 {
             // We are in the same view
@@ -712,7 +784,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
             self.enqueue_decision(novel_decision);
 
-            sequence_no = sequence_no + SeqNo::ONE;
+            sequence_no += SeqNo::ONE;
         }
 
         if view_index > 1 {
@@ -723,7 +795,13 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
         let option = self.view_queue.pop_front();
 
-        debug!("{:?} // Installing view {:?}, view index: {}. View queue: {:?}", self.node_id, view.sequence_number(), view_index, option);
+        debug!(
+            "{:?} // Installing view {:?}, view index: {}. View queue: {:?}",
+            self.node_id,
+            view.sequence_number(),
+            view_index,
+            option
+        );
 
         if let Some(messages) = option {
             for message in messages {
@@ -733,8 +811,15 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     }
 
     /// Enqueue a message from another view into it's correct queue
-    fn enqueue_other_view_message(&mut self, index: usize, message: ShareableMessage<PBFTMessage<D::Request>>) {
-        debug!("{:?} // Enqueuing a message from another view into the view queue. Index {}  {:?}", self.node_id, index, message);
+    fn enqueue_other_view_message(
+        &mut self,
+        index: usize,
+        message: ShareableMessage<PBFTMessage<RQ>>,
+    ) {
+        debug!(
+            "{:?} // Enqueuing a message from another view into the view queue. Index {}  {:?}",
+            self.node_id, index, message
+        );
 
         // Adjust the index to be 0 based
         let index = index - 1;
@@ -746,18 +831,19 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
         self.view_queue[index].push(message);
     }
 
-
     /// Finalize the view change protocol
     pub fn finalize_view_change<NT>(
         &mut self,
-        (header, message): (Header, ConsensusMessage<D::Request>),
+        (header, message): (Header, ConsensusMessage<RQ>),
         new_view: &ViewInfo,
-        synchronizer: &Synchronizer<D>,
+        synchronizer: &Synchronizer<RQ>,
         timeouts: &Timeouts,
-        log: &mut Log<D>,
+        _log: &mut Log<RQ>,
         node: &Arc<NT>,
-    ) -> Result<ConsensusStatus<D::Request>> where
-        NT: OrderProtocolSendNode<D, PBFT<D>> + 'static {
+    ) -> Result<ConsensusStatus<RQ>>
+    where
+        NT: OrderProtocolSendNode<RQ, PBFT<RQ>> + 'static,
+    {
         //Prepare the algorithm as we are already entering this phase
 
         self.install_view(new_view);
@@ -771,14 +857,18 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
 
             // Register the messages that we have received in this pre prepare from the view change
             // So the proposer doesn't repeat them
-            self.consensus_guard.install_sync_message_requests(final_rqs);
+            self.consensus_guard
+                .install_sync_message_requests(final_rqs);
         }
 
         // Advance the initialization phase of the first decision, which is the current decision
         // So the proposer won't try to propose anything to this decision
         self.decisions[0].skip_init_phase();
 
-        let shareable_message = Arc::new(ReadOnly::new(StoredMessage::new(header, PBFTMessage::Consensus(message))));
+        let shareable_message = Arc::new(ReadOnly::new(StoredMessage::new(
+            header,
+            PBFTMessage::Consensus(message),
+        )));
 
         let result = self.process_message(shareable_message, synchronizer, timeouts, node)?;
 
@@ -797,7 +887,7 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     }
 
     /// Enqueue a decision onto our overlapping decision log
-    fn enqueue_decision(&mut self, decision: ConsensusDecision<D>) {
+    fn enqueue_decision(&mut self, decision: ConsensusDecision<RQ>) {
         self.signalled.push_signalled(decision.sequence_number());
 
         self.decisions.push_back(decision);
@@ -819,8 +909,10 @@ impl<D> Consensus<D> where D: ApplicationData + 'static {
     }
 }
 
-impl<D> Orderable for Consensus<D>
-    where D: ApplicationData + 'static, {
+impl<RQ> Orderable for Consensus<RQ>
+where
+    RQ: SerType,
+{
     fn sequence_number(&self) -> SeqNo {
         self.seq_no
     }
@@ -892,7 +984,10 @@ impl ProposerConsensusGuard {
 
     /// Mark a given consensus sequence number as available to be proposed to
     pub fn make_seq_available(&self, seq: SeqNo) {
-        debug!("Making sequence number {:?} available for the proposer", seq);
+        debug!(
+            "Making sequence number {:?} available for the proposer",
+            seq
+        );
 
         let mut guard = self.seq_no_queue.lock().unwrap();
 
@@ -935,7 +1030,10 @@ impl ProposerConsensusGuard {
     pub(crate) fn install_sync_message_requests(&self, rqs: Vec<ClientRqInfo>) {
         let mut client_map = BTreeMap::new();
 
-        warn!("Installing sync message requests. Total: {} requests", rqs.len());
+        warn!(
+            "Installing sync message requests. Total: {} requests",
+            rqs.len()
+        );
 
         for req in rqs {
             let entry = client_map.entry(req.sender).or_insert_with(BTreeMap::new);
@@ -953,7 +1051,8 @@ impl ProposerConsensusGuard {
             //FIXME: If there is already a sync message, we should merge the two
             *guard = Some(client_map);
 
-            self.has_pending_view_change_reqs.store(true, Ordering::Relaxed);
+            self.has_pending_view_change_reqs
+                .store(true, Ordering::Relaxed);
         }
     }
 
@@ -963,7 +1062,8 @@ impl ProposerConsensusGuard {
 
         *guard = None;
 
-        self.has_pending_view_change_reqs.store(false, Ordering::Relaxed);
+        self.has_pending_view_change_reqs
+            .store(false, Ordering::Relaxed);
     }
 
     /// Clear all of the pending decisions waiting for a propose from this consensus guard

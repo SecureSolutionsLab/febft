@@ -1,21 +1,23 @@
+#![allow(clippy::reversed_empty_ranges)]
+
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
 use std::iter;
 
-use std::ops::{Add, Div};
+use atlas_common::crypto::hash::Digest;
+use atlas_common::error::*;
+use atlas_common::node_id::NodeId;
+use atlas_common::ordering::{Orderable, SeqNo};
+use atlas_common::system_params::SystemParams;
+use atlas_common::Err;
+use atlas_core::ordering_protocol::networking::serialize::NetworkView;
 use num_bigint::BigUint;
 use num_bigint::ToBigUint;
 use num_traits::identities::Zero;
 #[cfg(feature = "serialize_serde")]
 use serde::{Deserialize, Serialize};
+use std::ops::{Add, Div};
 use thiserror::Error;
-use atlas_common::crypto::hash::Digest;
-use atlas_common::Err;
-use atlas_common::ordering::{Orderable, SeqNo};
-use atlas_common::error::*;
-use atlas_common::node_id::NodeId;
-use atlas_core::ordering_protocol::networking::serialize::NetworkView;
-use atlas_common::system_params::SystemParams;
 
 /// This struct contains information related with an
 /// active `febft` view.
@@ -63,6 +65,7 @@ impl NetworkView for ViewInfo {
     }
 }
 
+
 const LEADER_COUNT: usize = 1;
 
 impl ViewInfo {
@@ -78,7 +81,7 @@ impl ViewInfo {
         let destined_leader = quorum_members[(usize::from(seq)) % n];
 
         let mut leader_set = vec![destined_leader];
-
+        
         for i in 1..LEADER_COUNT {
             leader_set.push(quorum_members[(usize::from(seq) + i) % n]);
         }
@@ -93,7 +96,7 @@ impl ViewInfo {
             params,
         })
     }
-    
+
     /// Creates a new instance of `ViewInfo`, from a given list of quorum members
     pub fn from_quorum(seq: SeqNo, quorum_members: Vec<NodeId>) -> Result<Self> {
         let n = quorum_members.len();
@@ -121,14 +124,18 @@ impl ViewInfo {
     }
 
     /// Initialize a view with a given leader set
-    pub fn with_leader_set(seq: SeqNo, n: usize, f: usize,
-                           quorum_participants: Vec<NodeId>,
-                           leader_set: Vec<NodeId>) -> Result<Self> {
+    pub fn with_leader_set(
+        seq: SeqNo,
+        n: usize,
+        f: usize,
+        quorum_participants: Vec<NodeId>,
+        leader_set: Vec<NodeId>,
+    ) -> Result<Self> {
         let params = SystemParams::new(n, f)?;
 
         for x in &leader_set {
             if !quorum_participants.contains(x) {
-                return Err!(ViewError::LeaderNotInQuorum(x.clone(), quorum_participants));
+                return Err!(ViewError::LeaderNotInQuorum(*x, quorum_participants));
             }
         }
 
@@ -167,7 +174,6 @@ impl ViewInfo {
             return None;
         }
 
-
         Some(Self::new(self.seq.prev(), self.params.n(), self.params.f()).unwrap())
     }
 
@@ -200,16 +206,19 @@ impl ViewInfo {
 /// Get the division of hash spaces for a given leader_set
 /// Divides the hash space for client requests across the various leaders.
 /// Each leader should get a similar slice of the pie.
-fn calculate_hash_space_division(leader_set: &Vec<NodeId>) -> BTreeMap<NodeId, (Vec<u8>, Vec<u8>)> {
+fn calculate_hash_space_division(leader_set: &[NodeId]) -> BTreeMap<NodeId, (Vec<u8>, Vec<u8>)> {
     let slices = divide_hash_space(Digest::LENGTH, leader_set.len());
 
     let mut slice_for_leaders = BTreeMap::new();
 
-    slices.into_iter().enumerate().for_each(|(leader_id, slice)| {
-        let leader = leader_set[leader_id].clone();
+    slices
+        .into_iter()
+        .enumerate()
+        .for_each(|(leader_id, slice)| {
+            let leader = leader_set[leader_id];
 
-        slice_for_leaders.insert(leader, slice);
-    });
+            slice_for_leaders.insert(leader, slice);
+        });
 
     slice_for_leaders
 }
@@ -267,7 +276,6 @@ fn divide_hash_space(size_bytes: usize, count: usize) -> Vec<(Vec<u8>, Vec<u8>)>
     slices
 }
 
-
 #[cfg(test)]
 mod view_tests {
     use rand_core::{RngCore, SeedableRng};
@@ -286,7 +294,7 @@ mod view_tests {
 
         let mut rng = rand::rngs::SmallRng::seed_from_u64(812679233723);
 
-        for i in 0..TESTS {
+        for _i in 0..TESTS {
             rng.fill_bytes(&mut digest_vec);
 
             let digest = Digest::from_bytes(&digest_vec).unwrap();
@@ -299,20 +307,31 @@ mod view_tests {
                 }
             }
 
-            assert_eq!(count, 1, "The digest {:?} was found in {} hash spaces", digest, count);
+            assert_eq!(
+                count, 1,
+                "The digest {:?} was found in {} hash spaces",
+                digest, count
+            );
         }
     }
 }
 
 impl Debug for ViewInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Seq: {:?}, quorum: {:?}, primary: {:?}, leader_set: {:?}, params: {:?}",
-               self.seq, self.quorum_members, self.leader(), self.leader_set, self.params)
+        write!(
+            f,
+            "Seq: {:?}, quorum: {:?}, primary: {:?}, leader_set: {:?}, params: {:?}",
+            self.seq,
+            self.quorum_members,
+            self.leader(),
+            self.leader_set,
+            self.params
+        )
     }
 }
 
 #[derive(Error, Debug)]
 pub enum ViewError {
     #[error("Leader is not contained in the quorum participants. Leader {0:?}, quorum {1:?}")]
-    LeaderNotInQuorum(NodeId, Vec<NodeId>)
+    LeaderNotInQuorum(NodeId, Vec<NodeId>),
 }

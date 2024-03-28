@@ -4,24 +4,20 @@
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
 
-use futures::io::{
-    AsyncWrite,
-    AsyncWriteExt,
-};
+
+use getset::Getters;
 #[cfg(feature = "serialize_serde")]
 use serde::{Deserialize, Serialize};
 
 use atlas_common::crypto::hash::Digest;
-use atlas_common::error::*;
+
 use atlas_common::node_id::NodeId;
 use atlas_common::ordering::{Orderable, SeqNo};
-use atlas_communication::message::Header;
-use atlas_core::messages::{RequestMessage, StoredRequestMessage};
-use atlas_smr_application::serialize::ApplicationData;
+use atlas_communication::message::{Header, StoredMessage};
 
 use crate::bft::log::decisions::CollectData;
-use crate::bft::sync::LeaderCollects;
 use crate::bft::sync::view::ViewInfo;
+use crate::bft::sync::LeaderCollects;
 
 pub mod serialize;
 
@@ -56,15 +52,9 @@ impl<R> Debug for PBFTMessage<R> {
 impl<R> Orderable for PBFTMessage<R> {
     fn sequence_number(&self) -> SeqNo {
         match self {
-            PBFTMessage::Consensus(consensus) => {
-                consensus.sequence_number()
-            }
-            PBFTMessage::ViewChange(view) => {
-                view.sequence_number()
-            }
-            PBFTMessage::ObserverMessage(obs) => {
-                SeqNo::ZERO
-            }
+            PBFTMessage::Consensus(consensus) => consensus.sequence_number(),
+            PBFTMessage::ViewChange(view) => view.sequence_number(),
+            PBFTMessage::ObserverMessage(_obs) => SeqNo::ZERO,
         }
     }
 }
@@ -154,9 +144,7 @@ impl<O> ViewChangeMessage<O> {
     pub fn take_collects(self) -> Option<LeaderCollects<O>> {
         match self.kind {
             ViewChangeMessageKind::Sync(collects) => Some(collects),
-            _ => {
-                None
-            }
+            _ => None,
         }
     }
 }
@@ -165,7 +153,7 @@ impl<O> ViewChangeMessage<O> {
 #[derive(Clone)]
 pub enum ViewChangeMessageKind<O> {
     /// A STOP message, broadcast when we want to call a view change due to requests getting timed out
-    Stop(Vec<StoredRequestMessage<O>>),
+    Stop(Vec<StoredMessage<O>>),
     /// A STOP message, broadcast when we want to call a view change due to us having received a Node Quorum Join message
     StopQuorumJoin(NodeId),
     // Each of the latest decisions from the sender, so the new leader can sync
@@ -211,7 +199,7 @@ pub enum ConsensusMessageKind<O> {
     ///
     /// The value `Vec<Digest>` contains a batch of hash digests of the
     /// serialized client requests to be proposed.
-    PrePrepare(Vec<StoredRequestMessage<O>>),
+    PrePrepare(Vec<StoredMessage<O>>),
     /// Prepare a batch of requests.
     ///
     /// The `Digest` represents the hash of the serialized `PRE-PREPARE`,
@@ -232,18 +220,17 @@ impl<O> Orderable for ConsensusMessage<O> {
     }
 }
 
-impl<O> Clone for ConsensusMessageKind<O> where O: Clone {
+impl<O> Clone for ConsensusMessageKind<O>
+where
+    O: Clone,
+{
     fn clone(&self) -> Self {
         match self {
             ConsensusMessageKind::PrePrepare(reqs) => {
                 ConsensusMessageKind::PrePrepare(reqs.clone())
             }
-            ConsensusMessageKind::Prepare(digest) => {
-                ConsensusMessageKind::Prepare(*digest)
-            }
-            ConsensusMessageKind::Commit(digest) => {
-                ConsensusMessageKind::Commit(*digest)
-            }
+            ConsensusMessageKind::Prepare(digest) => ConsensusMessageKind::Prepare(*digest),
+            ConsensusMessageKind::Commit(digest) => ConsensusMessageKind::Commit(*digest),
         }
     }
 }
@@ -284,11 +271,8 @@ impl<O> ConsensusMessage<O> {
 
     /// Takes the proposed client requests embedded in this consensus message,
     /// if they are available.
-    pub fn take_proposed_requests(&mut self) -> Option<Vec<StoredRequestMessage<O>>> {
-        let kind = std::mem::replace(
-            &mut self.kind,
-            ConsensusMessageKind::PrePrepare(Vec::new()),
-        );
+    pub fn take_proposed_requests(&mut self) -> Option<Vec<StoredMessage<O>>> {
+        let kind = std::mem::replace(&mut self.kind, ConsensusMessageKind::PrePrepare(Vec::new()));
         match kind {
             ConsensusMessageKind::PrePrepare(v) => Some(v),
             _ => {
@@ -300,9 +284,11 @@ impl<O> ConsensusMessage<O> {
 }
 
 #[cfg_attr(feature = "serialize_serde", derive(Serialize, Deserialize))]
-#[derive(Clone)]
+#[derive(Clone, Getters)]
 pub struct FwdConsensusMessage<O> {
+    #[get = "pub"]
     header: Header,
+    #[get = "pub"]
     consensus_msg: ConsensusMessage<O>,
 }
 
@@ -313,8 +299,6 @@ impl<O> FwdConsensusMessage<O> {
             consensus_msg: msg,
         }
     }
-
-    pub fn header(&self) -> &Header { &self.header }
 
     pub fn consensus(&self) -> &ConsensusMessage<O> {
         &self.consensus_msg
@@ -356,13 +340,13 @@ pub enum ObserveEventKind {
     Ready(SeqNo),
     ///Report that the given replica has received a preprepare request
     ///And it's now going to enter into it's prepare phase
-    /// 
+    ///
     ///  param is the seq no of the received preprepare request, and therefore
     /// of the current consensus instance
     Prepare(SeqNo),
     ///Report that the given replica has received all required prepare messages
     ///And is now going to enter consensus phase
-    /// 
+    ///
     /// param is the seq no of the current consensus instance
     Commit(SeqNo),
     ///Report that the given replica has received all required commit messages
@@ -436,7 +420,7 @@ impl<O> Debug for ViewChangeMessageKind<O> {
             ViewChangeMessageKind::Sync(_) => {
                 write!(f, "Sync message")
             }
-            ViewChangeMessageKind::StopQuorumJoin(node ) => {
+            ViewChangeMessageKind::StopQuorumJoin(node) => {
                 write!(f, "Stop quorum join message {:?}", node)
             }
         }
