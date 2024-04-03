@@ -2,10 +2,11 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::fmt::{Debug, Formatter};
 
 use either::Either;
-use event_listener::Event;
-use log::{debug, error, info, trace, warn};
+use event_listener::{Event, Listener};
+use tracing::{debug, error, info, trace, warn, instrument};
 
 use atlas_common::error::*;
 use atlas_common::globals::ReadOnly;
@@ -20,7 +21,7 @@ use atlas_communication::message::{Header, StoredMessage};
 use atlas_core::messages::{ClientRqInfo, SessionBased};
 use atlas_core::ordering_protocol::networking::OrderProtocolSendNode;
 use atlas_core::ordering_protocol::{Decision, ShareableMessage};
-use atlas_core::timeouts::Timeouts;
+use atlas_core::timeouts::timeout::TimeoutModHandle;
 use atlas_metrics::metrics::metric_increment;
 
 use crate::bft::consensus::decision::{
@@ -59,7 +60,6 @@ pub enum ConsensusStatus<O> {
     Decided(MaybeVec<OPDecision<O>>),
 }
 
-#[derive(Debug)]
 /// Represents the status of calling `poll()` on a `Consensus`.
 pub enum ConsensusPollStatus<O> {
     /// The `Replica` associated with this `Consensus` should
@@ -119,12 +119,10 @@ impl<O> TboQueue<O> {
     fn advance_queue(&mut self) -> MessageQueue<O> {
         self.curr_seq = self.curr_seq.next();
 
-        let pre_prepares = tbo_advance_message_queue_return(&mut self.pre_prepares)
-            .unwrap_or_default();
-        let prepares =
-            tbo_advance_message_queue_return(&mut self.prepares).unwrap_or_default();
-        let commits =
-            tbo_advance_message_queue_return(&mut self.commits).unwrap_or_default();
+        let pre_prepares =
+            tbo_advance_message_queue_return(&mut self.pre_prepares).unwrap_or_default();
+        let prepares = tbo_advance_message_queue_return(&mut self.prepares).unwrap_or_default();
+        let commits = tbo_advance_message_queue_return(&mut self.commits).unwrap_or_default();
 
         MessageQueue::from_messages(pre_prepares, prepares, commits)
     }
@@ -226,7 +224,7 @@ where
     /// for each consensus instance
     consensus_guard: Arc<ProposerConsensusGuard>,
     /// A reference to the timeouts
-    timeouts: Timeouts,
+    timeouts: TimeoutModHandle,
     /// Check if we are currently recovering from a fault, meaning we should ignore timeouts
     is_recovering: bool,
 }
@@ -241,7 +239,7 @@ where
         seq_no: SeqNo,
         watermark: u32,
         consensus_guard: Arc<ProposerConsensusGuard>,
-        timeouts: Timeouts,
+        timeouts: TimeoutModHandle,
     ) -> Self {
         let mut curr_seq = seq_no;
 
@@ -272,6 +270,7 @@ where
     }
 
     /// Queue a given message into our message queues.
+    #[instrument(skip(self), level = "debug")]
     pub fn queue(&mut self, message: ShareableMessage<PBFTMessage<RQ>>) {
         let message_seq = message.message().sequence_number();
 
@@ -325,8 +324,9 @@ where
             self.signalled.push_signalled(message_seq);
         }
     }
-
+    
     /// Poll the given consensus
+    #[instrument(skip_all, level = "debug", ret)]
     pub fn poll(&mut self) -> ConsensusPollStatus<RQ> {
         trace!("Current signal queue: {:?}", self.signalled);
 
@@ -378,11 +378,12 @@ where
         ConsensusPollStatus::Recv
     }
 
+    #[instrument(skip(self, synchronizer, timeouts, node), level = "debug")]
     pub fn process_message<NT>(
         &mut self,
         s_message: ShareableMessage<PBFTMessage<RQ>>,
         synchronizer: &Synchronizer<RQ>,
-        timeouts: &Timeouts,
+        timeouts: &TimeoutModHandle,
         node: &Arc<NT>,
     ) -> Result<ConsensusStatus<RQ>>
     where
@@ -506,6 +507,7 @@ where
     }
 
     /// Finalize the next consensus instance if possible
+    #[instrument(skip(self), level = "debug")]
     pub fn finalize(&mut self, view: &ViewInfo) -> Result<Option<CompletedBatch<RQ>>> {
         // If the decision can't be finalized, then we can't finalize the batch
         if let Some(decision) = self.decisions.front() {
@@ -537,6 +539,7 @@ where
     /// Advance to the next instance of the consensus
     /// This will also create the necessary new decision to keep the pending decisions
     /// equal to the water mark
+    #[instrument(skip(self), level = "debug")]
     pub fn next_instance(&mut self, view: &ViewInfo) -> ConsensusDecision<RQ> {
         let decision = self.decisions.pop_front().unwrap();
 
@@ -550,7 +553,7 @@ where
             self.is_recovering = false;
 
             // This means the queue is empty.
-            self.timeouts.cancel_client_rq_timeouts(None);
+            let _ = self.timeouts.cancel_all_timeouts();
         }
 
         let new_seq_no = self
@@ -569,6 +572,7 @@ where
         decision
     }
 
+    #[instrument(skip(self), level = "debug")]
     pub fn install_sequence_number(&mut self, novel_seq_no: SeqNo, view: &ViewInfo) {
         info!(
             "{:?} // Installing sequence number {:?} vs current {:?}",
@@ -719,6 +723,7 @@ where
     }
 
     /// Catch up to the quorums latest decided consensus
+    #[instrument(skip(self, proof, log), level = "debug", fields(proof_seq = proof.sequence_number().into_u32()))]
     pub fn catch_up_to_quorum(
         &mut self,
         view: &ViewInfo,
@@ -737,6 +742,7 @@ where
 
     /// Create a fake `PRE-PREPARE`. This is useful during the view
     /// change protocol.
+    #[instrument(skip(self, requests), level = "debug", fields(request_count = requests.len()))]
     pub fn forge_propose(&self, requests: Vec<StoredMessage<RQ>>, view: &ViewInfo) -> SysMsg<RQ> {
         PBFTMessage::Consensus(ConsensusMessage::new(
             self.sequence_number(),
@@ -746,6 +752,7 @@ where
     }
 
     /// Install a given view into the current consensus decisions.
+    #[instrument(skip(self), level = "debug")]
     pub fn install_view(&mut self, view: &ViewInfo) {
         let view_index = match view
             .sequence_number()
@@ -832,12 +839,13 @@ where
     }
 
     /// Finalize the view change protocol
+    #[instrument(skip(self, synchronizer, timeouts, node, _log), level = "debug")]
     pub fn finalize_view_change<NT>(
         &mut self,
         (header, message): (Header, ConsensusMessage<RQ>),
         new_view: &ViewInfo,
         synchronizer: &Synchronizer<RQ>,
-        timeouts: &Timeouts,
+        timeouts: &TimeoutModHandle,
         _log: &mut Log<RQ>,
         node: &Arc<NT>,
     ) -> Result<ConsensusStatus<RQ>>
@@ -1101,5 +1109,21 @@ impl Signals {
     fn clear(&mut self) {
         self.signaled_nos.clear();
         self.signaled_seq_no.clear();
+    }
+}
+
+impl<O> Debug for ConsensusPollStatus<O> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConsensusPollStatus::Recv => {
+                write!(f, "Receive messages")
+            }
+            ConsensusPollStatus::NextMessage(_) => {
+                write!(f, "Message Ready")
+            }
+            ConsensusPollStatus::Decided(_) => {
+                write!(f, "Decided instance")
+            }
+        }
     }
 }

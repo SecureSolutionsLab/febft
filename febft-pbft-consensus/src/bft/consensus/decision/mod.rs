@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use atlas_common::Err;
 use chrono::Utc;
-use log::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 use thiserror::Error;
 
 use atlas_common::error::*;
@@ -16,7 +16,7 @@ use atlas_communication::message::Header;
 use atlas_core::messages::{ClientRqInfo, SessionBased};
 use atlas_core::ordering_protocol::networking::OrderProtocolSendNode;
 use atlas_core::ordering_protocol::ShareableMessage;
-use atlas_core::timeouts::Timeouts;
+use atlas_core::timeouts::timeout::TimeoutModHandle;
 use atlas_metrics::metrics::metric_duration;
 
 use crate::bft::consensus::accessory::replica::ReplicaAccessory;
@@ -223,6 +223,7 @@ where
         }
     }
 
+    #[instrument(skip(self), level = "debug")]
     pub fn poll(&mut self) -> DecisionPollStatus<RQ> {
         match self.phase {
             DecisionPhase::Initialize => {
@@ -271,11 +272,12 @@ where
     }
 
     /// Process a message relating to this consensus instance
+    #[instrument(skip(self, synchronizer, timeouts, node), level = "debug")]
     pub fn process_message<NT>(
         &mut self,
         s_message: ShareableMessage<PBFTMessage<RQ>>,
         synchronizer: &Synchronizer<RQ>,
-        timeouts: &Timeouts,
+        timeouts: &TimeoutModHandle,
         node: &Arc<NT>,
     ) -> Result<DecisionStatus<RQ>>
     where
@@ -665,6 +667,7 @@ where
     }
 
     /// Finalize this consensus decision and return the information about the batch
+    #[instrument(skip(self), level = "debug")]
     pub fn finalize(self) -> Result<CompletedBatch<RQ>> {
         if let DecisionPhase::Decided = self.phase {
             let seq = self.sequence_number();
@@ -703,7 +706,7 @@ where
 fn request_batch_received<RQ>(
     header: &Header,
     pre_prepare: &ConsensusMessage<RQ>,
-    timeouts: &Timeouts,
+    timeouts: &TimeoutModHandle,
     synchronizer: &Synchronizer<RQ>,
     log: &WorkingDecisionLog<RQ>,
 ) -> Vec<ClientRqInfo>
