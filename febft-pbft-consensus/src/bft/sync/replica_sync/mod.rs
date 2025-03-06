@@ -12,11 +12,12 @@ use tracing::{debug, error, info};
 use atlas_common::collections;
 use atlas_common::node_id::NodeId;
 use atlas_common::ordering::Orderable;
-use atlas_common::serialization_helper::SerType;
+use atlas_common::serialization_helper::SerMsg;
 use atlas_communication::message::{Header, StoredMessage};
 use atlas_core::messages::{ClientRqInfo, ForwardedRequestsMessage, SessionBased};
 use atlas_core::ordering_protocol::networking::OrderProtocolSendNode;
-use atlas_core::request_pre_processing::{PreProcessorMessage, RequestPreProcessor};
+use atlas_core::request_pre_processing::network::RequestPreProcessingHandle;
+use atlas_core::request_pre_processing::RequestPreProcessing;
 use atlas_core::timeouts::timeout::{ModTimeout, TimeoutModHandle};
 use atlas_core::timeouts::{TimeOutable, TimeoutID};
 use atlas_metrics::metrics::{metric_duration, metric_increment};
@@ -40,12 +41,12 @@ use super::{AbstractSynchronizer, Synchronizer, SynchronizerStatus};
 // - TboQueue for sync phase messages
 // This synchronizer will only move forward on replica messages
 
-pub struct ReplicaSynchronizer<RQ: SerType> {
+pub struct ReplicaSynchronizer<RQ: SerMsg> {
     timeout_dur: Cell<Duration>,
     _phantom: PhantomData<fn() -> RQ>,
 }
 
-impl<RQ: SerType + SessionBased + 'static> ReplicaSynchronizer<RQ> {
+impl<RQ: SerMsg + SessionBased + 'static> ReplicaSynchronizer<RQ> {
     pub fn new(timeout_dur: Duration) -> Self {
         Self {
             timeout_dur: Cell::new(timeout_dur),
@@ -60,17 +61,18 @@ impl<RQ: SerType + SessionBased + 'static> ReplicaSynchronizer<RQ> {
     ///
     /// Therefore, we start by clearing our stopped requests and treating them as
     /// newly proposed requests (by resetting their timer)
-    pub(super) fn handle_stopping_quorum<NT>(
+    pub(super) fn handle_stopping_quorum<NT, RP>(
         &self,
         base_sync: &Synchronizer<RQ>,
         previous_view: ViewInfo,
         consensus: &Consensus<RQ>,
         log: &Log<RQ>,
-        pre_processor: &RequestPreProcessor<RQ>,
+        pre_processor: &RP,
         timeouts: &TimeoutModHandle,
         node: &NT,
     ) where
         NT: OrderProtocolSendNode<RQ, PBFT<RQ>>,
+        RP: RequestPreProcessing<RQ>,
     {
         // NOTE:
         // - install new view (i.e. update view seq no) (Done in the synchronizer)
@@ -235,7 +237,10 @@ impl<RQ: SerType + SessionBased + 'static> ReplicaSynchronizer<RQ> {
         //Notify the timeouts that we have received the following requests
         //TODO: Should this only be done after the commit phase?
 
-        let _ = timeouts.acks_received(transform_client_rq_to_timeouts_ack(timeout_info, sending_node));
+        let _ = timeouts.acks_received(transform_client_rq_to_timeouts_ack(
+            timeout_info,
+            sending_node,
+        ));
 
         metric_duration(SYNC_BATCH_RECEIVED_ID, start_time.elapsed());
 
@@ -243,12 +248,14 @@ impl<RQ: SerType + SessionBased + 'static> ReplicaSynchronizer<RQ> {
     }
 
     /// Register all of the requests that are missing from the view change
-    fn take_stopped_requests_and_register_them(
+    fn take_stopped_requests_and_register_them<RP>(
         &self,
         base_sync: &Synchronizer<RQ>,
-        pre_processor: &RequestPreProcessor<RQ>,
+        pre_processor: &RP,
         timeouts: &TimeoutModHandle,
-    ) {
+    ) where
+        RP: RequestPreProcessing<RQ>,
+    {
         // TODO: maybe optimize this `stopped_requests` call, to avoid
         // a heap allocation of a `Vec`?
 
@@ -261,9 +268,7 @@ impl<RQ: SerType + SessionBased + 'static> ReplicaSynchronizer<RQ> {
         let count = requests.len();
 
         // Register the requests with the pre-processor
-        pre_processor
-            .send_return(PreProcessorMessage::StoppedRequests(requests))
-            .unwrap();
+        pre_processor.process_stopped_requests(requests).unwrap();
 
         let _ = timeouts.request_timeouts(
             transform_client_rq_to_timeouts(rq_info),
@@ -483,10 +488,10 @@ impl<RQ: SerType + SessionBased + 'static> ReplicaSynchronizer<RQ> {
 /// So we protect collects, watching and tbo as those are the fields that are going to be
 /// accessed by both those threads.
 /// Since the other fields are going to be accessed by just 1 thread, we just need them to be Send, which they are
-unsafe impl<RQ: SerType> Sync for ReplicaSynchronizer<RQ> {}
+unsafe impl<RQ: SerMsg> Sync for ReplicaSynchronizer<RQ> {}
 
 fn transform_client_rq_to_timeouts(
-    client_rq: impl IntoIterator<Item=ClientRqInfo>,
+    client_rq: impl IntoIterator<Item = ClientRqInfo>,
 ) -> Vec<(TimeoutID, Option<Box<dyn TimeOutable>>)> {
     client_rq
         .into_iter()
@@ -504,7 +509,7 @@ fn transform_client_rq_to_timeouts(
 }
 
 fn transform_client_rq_to_timeouts_ack(
-    client_rq: impl IntoIterator<Item=ClientRqInfo>,
+    client_rq: impl IntoIterator<Item = ClientRqInfo>,
     from: NodeId,
 ) -> Vec<(TimeoutID, NodeId)> {
     client_rq

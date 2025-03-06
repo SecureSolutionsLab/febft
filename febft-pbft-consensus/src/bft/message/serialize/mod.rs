@@ -12,10 +12,10 @@ use std::sync::Arc;
 
 use atlas_common::error::*;
 use atlas_common::ordering::Orderable;
-use atlas_common::serialization_helper::SerType;
+use atlas_common::serialization_helper::SerMsg;
 use atlas_communication::message::Header;
 use atlas_communication::reconfiguration::NetworkInformationProvider;
-use atlas_core::ordering_protocol::loggable::PersistentOrderProtocolTypes;
+use atlas_core::ordering_protocol::loggable::message::PersistentOrderProtocolTypes;
 use atlas_core::ordering_protocol::networking::serialize::{
     OrderProtocolVerificationHelper, OrderingProtocolMessage, PermissionedOrderingProtocolMessage,
 };
@@ -34,11 +34,11 @@ pub mod serde;
 
 pub fn serialize_consensus<W, RQ>(w: &mut W, message: &ConsensusMessage<RQ>) -> Result<()>
 where
-    RQ: SerType,
+    RQ: SerMsg,
     W: Write + AsRef<[u8]> + AsMut<[u8]>,
 {
     #[cfg(feature = "serialize_capnp")]
-    capnp::serialize_consensus::<W, D>(w, message)?;
+    capnp::serialize_consensus::<W, RQ>(w, message)?;
 
     #[cfg(feature = "serialize_serde")]
     serde::serialize_consensus::<W, RQ>(message, w)?;
@@ -48,11 +48,11 @@ where
 
 pub fn deserialize_consensus<R, RQ>(r: R) -> Result<ConsensusMessage<RQ>>
 where
-    RQ: SerType,
+    RQ: SerMsg,
     R: Read + AsRef<[u8]>,
 {
     #[cfg(feature = "serialize_capnp")]
-    let result = capnp::deserialize_consensus::<R, D>(r)?;
+    let result = capnp::deserialize_consensus::<R, RQ>(r)?;
 
     #[cfg(feature = "serialize_serde")]
     let result = serde::deserialize_consensus::<R, RQ>(r)?;
@@ -65,10 +65,12 @@ pub struct PBFTConsensus<RQ>(PhantomData<fn() -> RQ>);
 
 impl<RQ> OrderingProtocolMessage<RQ> for PBFTConsensus<RQ>
 where
-    RQ: SerType,
+    RQ: SerMsg,
 {
     type ProtocolMessage = PBFTMessage<RQ>;
-    type ProofMetadata = ProofMetadata;
+    type DecisionMetadata = ProofMetadata;
+
+    type DecisionAdditionalInfo = ();
 
     fn internally_verify_message<NI, OPVH>(
         network_info: &Arc<NI>,
@@ -207,14 +209,14 @@ where
 
 impl<RQ> PermissionedOrderingProtocolMessage for PBFTConsensus<RQ>
 where
-    RQ: SerType,
+    RQ: SerMsg,
 {
     type ViewInfo = ViewInfo;
 }
 
 impl<RQ> PersistentOrderProtocolTypes<RQ, Self> for PBFTConsensus<RQ>
 where
-    RQ: SerType,
+    RQ: SerMsg,
 {
     type Proof = Proof<RQ>;
 

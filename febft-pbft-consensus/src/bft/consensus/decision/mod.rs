@@ -5,26 +5,30 @@ use std::time::Instant;
 
 use atlas_common::Err;
 use chrono::Utc;
-use tracing::{debug, info, instrument, warn};
 use thiserror::Error;
+use tracing::{debug, info, instrument, warn};
 
 use atlas_common::error::*;
 use atlas_common::node_id::NodeId;
 use atlas_common::ordering::{Orderable, SeqNo};
-use atlas_common::serialization_helper::SerType;
+use atlas_common::serialization_helper::SerMsg;
 use atlas_communication::message::Header;
 use atlas_core::messages::{ClientRqInfo, SessionBased};
+use atlas_core::metric::RQ_BATCH_TRACKING_ID;
 use atlas_core::ordering_protocol::networking::OrderProtocolSendNode;
 use atlas_core::ordering_protocol::ShareableMessage;
 use atlas_core::timeouts::timeout::TimeoutModHandle;
-use atlas_metrics::metrics::metric_duration;
+use atlas_metrics::metrics::{metric_correlation_id_passed, metric_duration};
 
 use crate::bft::consensus::accessory::replica::ReplicaAccessory;
 use crate::bft::consensus::accessory::{AccessoryConsensus, ConsensusDecisionAccessory};
 use crate::bft::log::deciding::{CompletedBatch, WorkingDecisionLog};
 use crate::bft::log::decisions::{IncompleteProof, ProofMetadata};
 use crate::bft::message::{ConsensusMessage, ConsensusMessageKind, PBFTMessage};
-use crate::bft::metric::{ConsensusMetrics, PRE_PREPARE_ANALYSIS_ID};
+use crate::bft::metric::{
+    ConsensusMetrics, BATCH_COMMIT_DONE, BATCH_PREPARE_DONE, BATCH_PRE_PREPARE_DONE,
+    PRE_PREPARE_ANALYSIS_ID,
+};
 use crate::bft::sync::view::ViewInfo;
 use crate::bft::sync::{AbstractSynchronizer, Synchronizer};
 use crate::bft::PBFT;
@@ -105,7 +109,7 @@ pub struct MessageQueue<O> {
 /// The information needed to make a decision on a batch of requests.
 pub struct ConsensusDecision<RQ>
 where
-    RQ: SerType,
+    RQ: SerMsg,
 {
     node_id: NodeId,
     /// The sequence number of this consensus decision
@@ -178,7 +182,7 @@ impl<O> MessageQueue<O> {
 
 impl<RQ> ConsensusDecision<RQ>
 where
-    RQ: SerType + SessionBased + 'static,
+    RQ: SerMsg + SessionBased + 'static,
 {
     pub fn init_decision(node_id: NodeId, seq_no: SeqNo, view: &ViewInfo) -> Self {
         Self {
@@ -419,6 +423,12 @@ where
 
                     self.message_queue.signal();
 
+                    metric_correlation_id_passed(
+                        RQ_BATCH_TRACKING_ID,
+                        self.sequence_number().into_u32().to_string(),
+                        BATCH_PRE_PREPARE_DONE.clone(),
+                    );
+
                     // Mark that we have transitioned to the next phase
                     result = DecisionStatus::Transitioned(Some(batch_metadata), s_message);
 
@@ -535,6 +545,12 @@ where
 
                     self.message_queue.signal();
 
+                    metric_correlation_id_passed(
+                        RQ_BATCH_TRACKING_ID,
+                        self.sequence_number().into_u32().to_string(),
+                        BATCH_PREPARE_DONE.clone(),
+                    );
+
                     result = DecisionStatus::Transitioned(None, s_message);
 
                     DecisionPhase::Committing(0)
@@ -631,6 +647,12 @@ where
                         &**node,
                     );
 
+                    metric_correlation_id_passed(
+                        RQ_BATCH_TRACKING_ID,
+                        self.sequence_number().into_u32().to_string(),
+                        BATCH_COMMIT_DONE.clone(),
+                    );
+
                     Ok(DecisionStatus::Decided(s_message))
                 } else {
                     debug!(
@@ -695,7 +717,7 @@ where
 
 impl<RQ> Orderable for ConsensusDecision<RQ>
 where
-    RQ: SerType,
+    RQ: SerMsg,
 {
     fn sequence_number(&self) -> SeqNo {
         self.seq
@@ -711,7 +733,7 @@ fn request_batch_received<RQ>(
     log: &WorkingDecisionLog<RQ>,
 ) -> Vec<ClientRqInfo>
 where
-    RQ: SerType + SessionBased + 'static,
+    RQ: SerMsg + SessionBased + 'static,
 {
     let start = Instant::now();
 

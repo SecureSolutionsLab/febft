@@ -1,5 +1,7 @@
 use atlas_metrics::metrics::{metric_duration, metric_store_count, MetricKind};
 use atlas_metrics::{MetricLevel, MetricRegistry};
+use lazy_static::lazy_static;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Consensus will take the ID range 1XX, for now
@@ -40,48 +42,54 @@ pub const PROPOSE_LATENCY_ID: usize = 110;
 pub const CONSENSUS_PRE_PREPARE_LATENCY: &str = "PRE_PREPARE_LATENCY";
 pub const CONSENSUS_PRE_PREPARE_LATENCY_ID: usize = 111;
 
+pub const CONSENSUS_PRE_PREPARE_TO_PREPARE_LATENCY: &str = "PRE_PREPARE_TO_PREPARE_LATENCY";
+pub const CONSENSUS_PRE_PREPARE_TO_PREPARE_LATENCY_ID: usize = 112;
+
 pub const CONSENSUS_PREPARE_LATENCY: &str = "PREPARE_LATENCY";
-pub const CONSENSUS_PREPARE_LATENCY_ID: usize = 112;
+pub const CONSENSUS_PREPARE_LATENCY_ID: usize = 113;
+
+pub const CONSENSUS_PREPARE_TO_COMMIT_LATENCY: &str = "PREPARE_TO_COMMIT_LATENCY";
+pub const CONSENSUS_PREPARE_TO_COMMIT_LATENCY_ID: usize = 114;
 
 pub const CONSENSUS_COMMIT_LATENCY: &str = "COMMIT_LATENCY";
-pub const CONSENSUS_COMMIT_LATENCY_ID: usize = 113;
+pub const CONSENSUS_COMMIT_LATENCY_ID: usize = 115;
 
 pub const BATCH_SIZE: &str = "BATCH_SIZE";
-pub const BATCH_SIZE_ID: usize = 114;
+pub const BATCH_SIZE_ID: usize = 116;
 
 pub const PRE_PREPARE_ANALYSIS: &str = "PRE_PREPARE_RQ_ANALYSIS";
-pub const PRE_PREPARE_ANALYSIS_ID: usize = 115;
+pub const PRE_PREPARE_ANALYSIS_ID: usize = 117;
 
 pub const PRE_PREPARE_LOG_ANALYSIS: &str = "PRE_PREPARE_LOG_ANALYSIS";
-pub const PRE_PREPARE_LOG_ANALYSIS_ID: usize = 116;
+pub const PRE_PREPARE_LOG_ANALYSIS_ID: usize = 118;
 
 pub const OPERATIONS_ORDERED: &str = "OPERATIONS_ORDERED";
-pub const OPERATIONS_ORDERED_ID: usize = 117;
+pub const OPERATIONS_ORDERED_ID: usize = 119;
 
 pub const CONSENSUS_INSTALL_STATE_TIME: &str = "CONSENSUS_INSTALL_STATE_TIME";
-pub const CONSENSUS_INSTALL_STATE_TIME_ID: usize = 118;
+pub const CONSENSUS_INSTALL_STATE_TIME_ID: usize = 120;
 
 pub const MSG_LOG_INSTALL_TIME: &str = "MSG_LOG_INSTALL_TIME";
-pub const MSG_LOG_INSTALL_TIME_ID: usize = 119;
+pub const MSG_LOG_INSTALL_TIME_ID: usize = 121;
 
 /// 120-129: Synchronizer
 pub const SYNC_WATCH_REQUESTS: &str = "SYNC_WATCH_REQUESTS";
-pub const SYNC_WATCH_REQUESTS_ID: usize = 120;
+pub const SYNC_WATCH_REQUESTS_ID: usize = 150;
 
 pub const SYNC_BATCH_RECEIVED: &str = "SYNC_BATCH_RECEIVED";
-pub const SYNC_BATCH_RECEIVED_ID: usize = 121;
+pub const SYNC_BATCH_RECEIVED_ID: usize = 151;
 
 pub const SYNC_STOPPED_REQUESTS: &str = "SYNC_STOPPED_REQUESTS";
-pub const SYNC_STOPPED_REQUESTS_ID: usize = 122;
+pub const SYNC_STOPPED_REQUESTS_ID: usize = 152;
 
 pub const SYNC_STOPPED_COUNT: &str = "SYNC_REQUESTS_COUNT";
-pub const SYNC_STOPPED_COUNT_ID: usize = 123;
+pub const SYNC_STOPPED_COUNT_ID: usize = 153;
 
 pub const SYNC_FORWARDED_REQUESTS: &str = "SYNC_FORWARDED_REQUESTS";
-pub const SYNC_FORWARDED_REQUESTS_ID: usize = 124;
+pub const SYNC_FORWARDED_REQUESTS_ID: usize = 154;
 
 pub const SYNC_FORWARDED_COUNT: &str = "SYNC_FORWARDED_COUNT";
-pub const SYNC_FORWARDED_COUNT_ID: usize = 125;
+pub const SYNC_FORWARDED_COUNT_ID: usize = 155;
 
 pub fn metrics() -> Vec<MetricRegistry> {
     vec![
@@ -138,12 +146,6 @@ pub fn metrics() -> Vec<MetricRegistry> {
         )
             .into(),
         (
-            CONSENSUS_PRE_PREPARE_LATENCY_ID,
-            CONSENSUS_PRE_PREPARE_LATENCY.to_string(),
-            MetricKind::Duration,
-        )
-            .into(),
-        (
             PROPOSER_LATENCY_ID,
             PROPOSER_LATENCY.to_string(),
             MetricKind::Duration,
@@ -162,8 +164,20 @@ pub fn metrics() -> Vec<MetricRegistry> {
         )
             .into(),
         (
+            CONSENSUS_PRE_PREPARE_TO_PREPARE_LATENCY_ID,
+            CONSENSUS_PRE_PREPARE_TO_PREPARE_LATENCY.to_string(),
+            MetricKind::Duration,
+        )
+            .into(),
+        (
             CONSENSUS_PREPARE_LATENCY_ID,
             CONSENSUS_PREPARE_LATENCY.to_string(),
+            MetricKind::Duration,
+        )
+            .into(),
+        (
+            CONSENSUS_PREPARE_TO_COMMIT_LATENCY_ID,
+            CONSENSUS_PREPARE_TO_COMMIT_LATENCY.to_string(),
             MetricKind::Duration,
         )
             .into(),
@@ -303,6 +317,11 @@ impl ConsensusMetrics {
 
     pub fn first_prepare_recvd(&mut self) {
         self.first_prepare_rcvd_time = Instant::now();
+
+        metric_duration(
+            CONSENSUS_PRE_PREPARE_TO_PREPARE_LATENCY_ID,
+            self.pre_prepare_recvd_time.elapsed(),
+        );
     }
 
     pub fn prepare_quorum_recvd(&mut self) {
@@ -311,11 +330,16 @@ impl ConsensusMetrics {
         metric_duration(
             CONSENSUS_PREPARE_LATENCY_ID,
             self.first_prepare_rcvd_time.elapsed(),
-        )
+        );
     }
 
     pub fn first_commit_recvd(&mut self) {
         self.first_commit_rcvd_time = Instant::now();
+
+        metric_duration(
+            CONSENSUS_PREPARE_TO_COMMIT_LATENCY_ID,
+            self.prepare_quorum_time.elapsed(),
+        )
     }
 
     pub fn commit_quorum_recvd(&mut self) {
@@ -323,7 +347,15 @@ impl ConsensusMetrics {
 
         metric_duration(
             CONSENSUS_COMMIT_LATENCY_ID,
-            self.first_commit_rcvd_time.elapsed(),
+            self.prepare_quorum_time.elapsed(),
         )
     }
+}
+
+lazy_static! {
+    pub static ref ENTERED_PRE_PROPOSER: Arc<str> = Arc::from("ENTERED_PRE_PROPOSER");
+    pub static ref BATCH_CREATED: Arc<str> = Arc::from("CREATED_BATCH");
+    pub static ref BATCH_PRE_PREPARE_DONE: Arc<str> = Arc::from("BATCH_PRE_PREPARE_DONE");
+    pub static ref BATCH_PREPARE_DONE: Arc<str> = Arc::from("BATCH_PREPARE_DONE");
+    pub static ref BATCH_COMMIT_DONE: Arc<str> = Arc::from("BATCH_COMMIT_DONE");
 }

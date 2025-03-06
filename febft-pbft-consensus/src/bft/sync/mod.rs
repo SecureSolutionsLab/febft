@@ -12,9 +12,9 @@ use std::{
 use either::Either;
 use getset::Getters;
 use intmap::IntMap;
-use tracing::{debug, error, info, warn};
 #[cfg(feature = "serialize_serde")]
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 
 use atlas_common::crypto::hash::Digest;
 use atlas_common::error::*;
@@ -22,8 +22,10 @@ use atlas_common::node_id::NodeId;
 use atlas_common::ordering::{
     tbo_advance_message_queue, tbo_pop_message, tbo_queue_message_arc, Orderable, SeqNo,
 };
-use atlas_common::serialization_helper::SerType;
+use atlas_common::quiet_unwrap;
+use atlas_common::serialization_helper::SerMsg;
 use atlas_common::{collections, prng};
+
 use atlas_communication::lookup_table::MessageModule;
 use atlas_communication::message::{Header, StoredMessage, WireMessage};
 use atlas_communication::reconfiguration::NetworkInformationProvider;
@@ -31,8 +33,8 @@ use atlas_core::messages::{ClientRqInfo, SessionBased};
 use atlas_core::ordering_protocol::networking::OrderProtocolSendNode;
 use atlas_core::ordering_protocol::reconfigurable_order_protocol::ReconfigurationAttemptResult;
 use atlas_core::ordering_protocol::{unwrap_shareable_message, ShareableMessage};
+use atlas_core::request_pre_processing::{RequestPProcessorSync, RequestPreProcessing};
 
-use atlas_core::request_pre_processing::RequestPreProcessor;
 use atlas_core::timeouts::timeout::{ModTimeout, TimeoutModHandle};
 
 use crate::bft::consensus::{Consensus, ConsensusStatus};
@@ -43,7 +45,7 @@ use crate::bft::message::{
     ViewChangeMessageKind,
 };
 use crate::bft::sync::view::ViewInfo;
-use crate::bft::{OPDecision, PBFT};
+use crate::bft::{FeDecision, PBFT};
 
 use self::{follower_sync::FollowerSynchronizer, replica_sync::ReplicaSynchronizer};
 
@@ -386,10 +388,10 @@ pub enum SynchronizerStatus<O> {
     /// The view change protocol is currently running.
     Running,
     /// The view change protocol just finished running.
-    NewView(ConsensusStatus<O>, Option<OPDecision<O>>),
+    NewView(ConsensusStatus<O>, Option<FeDecision<O>>),
     /// The view change protocol just finished running and we
     /// have successfully joined the quorum.
-    NewViewJoinedQuorum(ConsensusStatus<O>, Option<OPDecision<O>>, NodeId),
+    NewViewJoinedQuorum(ConsensusStatus<O>, Option<FeDecision<O>>, NodeId),
     /// Before we finish the view change protocol, we need
     /// to run the CST protocol.
     RunCst,
@@ -438,7 +440,7 @@ pub enum SyncReconfigurationResult {
 ///A trait describing some of the necessary methods for the synchronizer
 pub trait AbstractSynchronizer<RQ>
 where
-    RQ: SerType,
+    RQ: SerMsg,
 {
     /// Returns information regarding the current view, such as
     /// the number of faulty replicas the system can tolerate.
@@ -451,19 +453,19 @@ where
     fn queue(&self, message: ShareableMessage<PBFTMessage<RQ>>);
 }
 
-type CollectsType<RQ> = IntMap<StoredMessage<PBFTMessage<RQ>>>;
+type CollectsType<RQ> = IntMap<u64, StoredMessage<PBFTMessage<RQ>>>;
 
 ///The synchronizer for the SMR protocol
 /// This part of the protocol is responsible for handling the changing of views and
 /// for keeping track of any timed out client requests
-pub struct Synchronizer<RQ: SerType> {
+pub struct Synchronizer<RQ: SerMsg> {
     node_id: NodeId,
 
     phase: Cell<ProtoPhase>,
     //Tbo queue, keeps track of the current view and keeps messages arriving in order
     tbo: Mutex<TboQueue<RQ>>,
     //Stores currently received requests from other nodes
-    stopped: RefCell<IntMap<Vec<StoredMessage<RQ>>>>,
+    stopped: RefCell<IntMap<u64, Vec<StoredMessage<RQ>>>>,
     //Stores currently received requests from other nodes
     currently_adding_node: Cell<Option<NodeId>>,
     //Stores which nodes are currently being added to the quorum, along with the number of votes
@@ -486,11 +488,11 @@ pub struct Synchronizer<RQ: SerType> {
 /// So we protect collects, watching and tbo as those are the fields that are going to be
 /// accessed by both those threads.
 /// Since the other fields are going to be accessed by just 1 thread, we just need them to be Send, which they are
-unsafe impl<RQ: SerType> Sync for Synchronizer<RQ> {}
+unsafe impl<RQ: SerMsg> Sync for Synchronizer<RQ> {}
 
 impl<RQ> AbstractSynchronizer<RQ> for Synchronizer<RQ>
 where
-    RQ: SerType + SessionBased + 'static,
+    RQ: SerMsg + SessionBased + 'static,
 {
     /// Returns some information regarding the current view, such as
     /// the number of faulty replicas the system can tolerate.
@@ -560,7 +562,7 @@ where
 
 impl<RQ> Synchronizer<RQ>
 where
-    RQ: SerType + SessionBased + 'static,
+    RQ: SerMsg + SessionBased + 'static,
 {
     pub fn new_follower(node_id: NodeId, view: ViewInfo) -> Arc<Self> {
         Arc::new(Self {
@@ -720,17 +722,18 @@ where
     /// Advances the state of the view change state machine.
     //
     // TODO: retransmit STOP msgs
-    pub fn process_message<NT>(
+    pub fn process_message<NT, RP>(
         &self,
         s_message: ShareableMessage<PBFTMessage<RQ>>,
         timeouts: &TimeoutModHandle,
         log: &mut Log<RQ>,
-        rq_pre_processor: &RequestPreProcessor<RQ>,
+        rq_pre_processor: &RP,
         consensus: &mut Consensus<RQ>,
         node: &Arc<NT>,
     ) -> SynchronizerStatus<RQ>
     where
         NT: OrderProtocolSendNode<RQ, PBFT<RQ>> + 'static,
+        RP: RequestPreProcessing<RQ> + RequestPProcessorSync<RQ>,
     {
         debug!(
             "{:?} // Processing view change message {:?} in phase {:?} from {:?}",
@@ -1242,7 +1245,10 @@ where
                                 */
                             }
 
-                            let p = rq_pre_processor.collect_all_pending_rqs();
+                            let p = quiet_unwrap!(
+                                rq_pre_processor.collect_pending_rqs(),
+                                SynchronizerStatus::Running
+                            );
                             let node_sign = node.network_info_provider().get_key_pair().clone();
 
                             //We create the pre-prepare here as we are the new leader,
@@ -1912,7 +1918,7 @@ where
     // may be executing the same CID when there is a leader change
     #[inline]
     fn normalized_collects(
-        collects: &IntMap<StoredMessage<PBFTMessage<RQ>>>,
+        collects: &IntMap<u64, StoredMessage<PBFTMessage<RQ>>>,
         in_exec: SeqNo,
     ) -> impl Iterator<Item = Option<&'_ CollectData<RQ>>> {
         let values = collects.values();
@@ -1925,7 +1931,7 @@ where
     // TODO: quorum sizes may differ when we implement reconfiguration
     #[inline]
     fn highest_proof<'a, NT>(
-        guard: &'a IntMap<StoredMessage<PBFTMessage<RQ>>>,
+        guard: &'a IntMap<u64, StoredMessage<PBFTMessage<RQ>>>,
         view: &ViewInfo,
         node: &NT,
     ) -> Option<&'a Proof<RQ>>
@@ -1938,7 +1944,7 @@ where
 
 ///The accessory services that complement the base follower state machine
 /// This allows us to maximize code re usage and therefore reduce the amount of failure places
-pub enum SynchronizerAccessory<RQ: SerType> {
+pub enum SynchronizerAccessory<RQ: SerMsg> {
     Follower(FollowerSynchronizer<RQ>),
     Replica(ReplicaSynchronizer<RQ>),
 }
@@ -2182,7 +2188,7 @@ fn signed_collects<RQ, NT>(
     collects: Vec<StoredMessage<PBFTMessage<RQ>>>,
 ) -> Vec<StoredMessage<PBFTMessage<RQ>>>
 where
-    RQ: SerType,
+    RQ: SerMsg,
     NT: OrderProtocolSendNode<RQ, PBFT<RQ>>,
 {
     collects
@@ -2193,7 +2199,7 @@ where
 
 fn validate_signature<'a, RQ, M, NT>(node: &'a NT, stored: &'a StoredMessage<M>) -> bool
 where
-    RQ: SerType,
+    RQ: SerMsg,
     NT: OrderProtocolSendNode<RQ, PBFT<RQ>>,
 {
     //TODO: Fix this as I believe it will always be false
@@ -2229,7 +2235,7 @@ where
 
 fn highest_proof<'a, RQ, I, NT>(view: &ViewInfo, node: &NT, collects: I) -> Option<&'a Proof<RQ>>
 where
-    RQ: SerType,
+    RQ: SerMsg,
     I: Iterator<Item = &'a StoredMessage<PBFTMessage<RQ>>>,
     NT: OrderProtocolSendNode<RQ, PBFT<RQ>>,
 {
